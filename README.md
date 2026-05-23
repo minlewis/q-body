@@ -74,6 +74,10 @@ q-body/
 └── README.md
 ```
 
+## License
+
+MIT
+
 ## A2A Methods
 
 | Method | Alias | Description |
