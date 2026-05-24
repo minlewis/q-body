@@ -1,1 +1,12 @@
 /target
+__pycache__/
+*.pyc
+
+# Rust build artifacts
+target/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo

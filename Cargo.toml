@@ -1,0 +1,25 @@
+[package]
+name = "q-body"
+version = "0.1.1"
+edition = "2024"
+description = "Q宝宝的自进化身体 — Rust A2A Agent"
+
+[dependencies]
+# Web 框架
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# JSON 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID（Task ID 生成）
+uuid = { version = "1", features = ["v4"] }
+
+# HTTP 客户端（调 LLM API）— 用 rustls 避免系统 OpenSSL 依赖
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
