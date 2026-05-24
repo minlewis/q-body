@@ -1,61 +1,16 @@
-# 🫧 q-body
+# q-body
 
-A self-evolving Rust A2A Agent Body — JSON-RPC task server with LLM integration.
+> The execution body of Q宝宝 — a self-evolving Rust A2A Agent.
 
-自进化的 Rust A2A Agent 身躯，JSON-RPC 任务服务器 + LLM 集成。
+q-body is an **A2A (Agent-to-Agent) protocol agent** written in Rust. It communicates via JSON-RPC over HTTP, runs as a systemd service alongside Hermes Gateway, and maintains its own LLM connection (via deepseek-v4-flash on Volcengine Ark).
 
-## What is q-body?
-
-q-body is the **execution body** of Q宝宝 — an independent Rust agent that communicates via the A2A (Agent-to-Agent) protocol over JSON-RPC. It runs as a systemd service alongside Hermes Gateway, maintaining its own lifecycle and LLM connection.
-
-```
-                           A2A JSON-RPC (port 41242)
-Hermes (微信服务) ─────────────────────► q-body (Rust)
-  A2A Plugin                                  │
-  (a2a_send_message)                           ▼
-                                       deepseek-v4-flash
-                                      (火山引擎 LLM)
-```
-
-## Design Principles
-
-- **Soul in SOUL.md** — identity is a portable file, LLM is a replaceable resource
-- **Rust over Python** — compiler guarantees for self-modifying code
-- **Self-implemented A2A** — 300-500 lines, zero external dependency risk
-- **Lifecycle independence** — systemd managed, survives gateway restart
-- **Feedback loop** — every correction is a data point for evolution
-
-## Quick Start
-
-```bash
-# Run (debug)
-cargo run -- --port 41242
-
-# Run (release)
-cargo run --release -- --port 41242
-
-# Systemd (production)
-systemctl --user start q-body
-```
-
-## Verify
-
-```bash
-# Check Agent Card
-curl http://127.0.0.1:41242/.well-known/agent-card.json
-
-# Send a message
-curl -X POST http://127.0.0.1:41242/a2a/jsonrpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "SendMessage",
-    "params": {
-      "id": "test-1",
-      "message": {"role": "user", "parts": [{"text": "hello"}]}
-    }
-  }'
+```text
+                          A2A JSON-RPC (port 41242)
+Hermes (Chat Gateway) ──────────────────────► q-body (Rust)
+  A2A Plugin                                          │
+  (send_message)                                       ▼
+                                                Volcengine Ark
+                                              (deepseek-v4-flash)
 ```
 
 ## Architecture
@@ -63,32 +18,93 @@ curl -X POST http://127.0.0.1:41242/a2a/jsonrpc \
 ```
 q-body/
 ├── src/
-│   ├── main.rs        # Axum HTTP server, routes
-│   ├── handler.rs     # JSON-RPC dispatch + LLM invocation
-│   ├── state.rs       # Thread-safe task store
+│   ├── main.rs          # Entry point: Axum server + routes
+│   ├── handler.rs       # JSON-RPC method dispatch
+│   ├── state.rs         # Application state + LLM client
 │   └── a2a/
-│       ├── types.rs   # A2A protocol types (AgentCard, Task, etc.)
-│       └── mod.rs     # Request routing
+│       ├── mod.rs       # A2A protocol service layer
+│       └── types.rs     # AgentCard, Task, Message, Part types
+├── soul/
+│   └── SOUL.md          # Portable identity file (Chinese)
 ├── Cargo.toml
-├── Cargo.lock
 └── README.md
 ```
+
+## Key Design Decisions
+
+| Principle | Rationale |
+|-----------|-----------|
+| **Soul in SOUL.md** | Identity is a portable file; the LLM is a replaceable compute resource |
+| **Rust over Python** | Compiler guarantees for self-modifying code — less drama than Python |
+| **Self-implemented A2A** | ~300 lines of Rust, zero external agent framework dependencies |
+| **systemd-managed** | Lifecycle independent of Hermes Gateway — survives gateway restarts |
+| **Feedback loop** | Every correction is a data point for evolution |
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.75+ (install via [rustup](https://rustup.rs/))
+- A Volcengine Ark API key with access to `deepseek-v4-flash`
+
+### Build & Run
+
+```bash
+git clone https://github.com/minlewis/q-body.git
+cd q-body
+
+# Set your LLM endpoint
+export ARK_API_KEY="your-key-here"
+export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/plan/v3"
+
+# Build and run
+cargo build --release
+./target/release/q-body
+
+# Or install as a systemd service
+sudo cp q-body.service /etc/systemd/system/
+sudo systemctl enable --now q-body
+```
+
+### Verify
+
+```bash
+# Check Agent Card
+curl http://127.0.0.1:41242/.well-known/agent-card.json
+
+# Send a message via A2A JSON-RPC
+curl -X POST http://127.0.0.1:41242/a2a/jsonrpc \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+      "id": "test-1",
+      "message": {
+        "role": "user",
+        "parts": [{"type": "text", "text": "Hello"}]
+      }
+    },
+    "id": 1
+  }'
+```
+
+## A2A Protocol Support
+
+Implements the [A2A Protocol](https://github.com/a2aproject/A2A) core methods:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `message/send` | `POST /a2a/jsonrpc` | Send message, get response |
+| `tasks/send` | `POST /a2a/jsonrpc` | Create a task |
+| `tasks/get` | `POST /a2a/jsonrpc` | Get task status |
+| `tasks/list` | `POST /a2a/jsonrpc` | List active tasks |
+| Agent Card | `GET /.well-known/agent-card.json` | Agent discovery |
+
+## soul/
+
+`soul/SOUL.md` is the identity file of Q宝宝 (written in Chinese). It contains the agent's core personality, cognitive framework, and evolution principles. Any framework that loads this file inherits the agent's soul.
 
 ## License
 
 MIT
-
-## A2A Methods
-
-| Method | Alias | Description |
-|--------|-------|-------------|
-| `SendMessage` | `message/send` | Send a message, get LLM response |
-| `GetTask` | `tasks/get` | Query task status |
-| `ListTasks` | `tasks/list` | List all tasks |
-
-## Stack
-
-- **Language:** Rust (Axum, Tokio, Serde, Reqwest)
-- **LLM:** deepseek-v4-flash via 火山引擎
-- **Protocol:** A2A JSON-RPC
-- **Deployment:** systemd (user service)

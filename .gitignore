@@ -2,9 +2,6 @@
 __pycache__/
 *.pyc
 
-# Rust build artifacts
-target/
-
 # IDE files
 .vscode/
 .idea/
