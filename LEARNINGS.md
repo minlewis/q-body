@@ -77,3 +77,84 @@ permissions（bash 命令白名单）、directories（文件访问限制）、MC
 - **Phase 2 — 持久化**：SQLite TaskStore，重启不丢对话
 - **Phase 3 — 可观测性**：/health 端点 + 测试补齐 + 结构化日志
 - **Phase 4 — Streaming + Tool calling**：SSE 流式返回 + 工具注册框架
+---
+
+## 2026-05-26 — 对标学习：AgentScope 2.0（25622★）
+
+> 阿里出品，生产级 Python agent 框架。内置 A2A/MCP 支持、事件流、Toolkit、记忆系统。
+
+### 关键发现
+
+#### 1. 架构：Middleware Onion（中间件洋葱）
+
+AgentScope 的核心是一个 `Agent` 类，用多层中间件包裹 `reply` 流程：
+
+```
+reply_stream → mw1 → mw2 → _reply_impl
+                              ↓
+                       _reasoning (LLM call)
+                              ↓
+                       _execute_tool_call
+                              ↓
+                       _acting (toolkit.call_tool)
+```
+
+**q-body 可以抄**：用 `trait AgentHook` + `Pin<Box<dyn Stream>>` 在 Rust 里实现同样的中间件链。
+
+#### 2. A2A 集成方式
+
+AgentScope 没有专门的 A2A 客户端——它用 `ProtocolMiddlewareBase` 做协议转换：
+
+```
+AgentEvent 流 → ProtocolMiddlewareBase._convert_to_protocol() → A2A JSON/SSE
+```
+
+**对 q-body 的启示**：内部用统一的 `AgentEvent` 枚举，外部通过中间件转成 A2A 协议。
+q-body 当前直接把外部请求映射到 LLM 调用，缺少中间的事件抽象层。
+
+#### 3. Toolkit 系统（最值得复用的模式）
+
+三层抽象：
+- **ToolBase trait** — name, description, input_schema(JSON Schema), async call
+- **Adapters** — FunctionTool（包装任意函数）、MCPTool（包装 MCP 客户端）
+- **Toolkit registry** — 按组管理，支持动态激活/停用
+
+**q-body 的差距**：目前没有 tool calling 能力，只能"调 LLM 回复"。
+AgentScope 的 toolkit 设计可以直接翻译成 Rust 的 trait 体系。
+
+#### 4. Event Streaming 事件系统
+
+AgentScope 定义了一整套 AgentEvent 区分联合：
+
+| Event | 对应 A2A |
+|-------|---------|
+| ReplyStartEvent | TaskStatusUpdateEvent(status=WORKING) |
+| TextBlockDeltaEvent | SSE text delta |
+| ToolCallStartEvent | TaskArtifactUpdateEvent |
+| ReplyEndEvent | TaskStatusUpdateEvent(status=COMPLETED) |
+
+**对 q-body 的启示**：事件驱动的架构天然适配 A2A 的 SSE 协议。
+q-body 的 Phase 4（Streaming）应该先用 AgentEvent 枚举统一内部事件模型，
+再通过中间件转成 SSE 输出。
+
+#### 5. 记忆系统
+
+两层记忆：
+- **Working context**: `Vec<Msg>` — 当前对话轮次
+- **Compressed summary**: LLM 生成的 5 字段结构化摘要（task_overview, current_state, important_discoveries, next_steps, context_to_preserve）
+
+**对 q-body 的启示**：TaskStore 不仅要存对话历史，还要支持上下文压缩。
+这比纯 SQLite 持久化更有价值——是让 q-body 拥有"记忆"的关键模式。
+
+### 更新后的重构路线图
+
+基于 yoyo + AgentScope 的双重学习，调整优先级：
+
+```
+Phase 1 — 配置化（q-body.toml）
+Phase 2 — Event 系统 + Toolkit 框架（先于持久化！）
+  原因：AgentScope 的实践表明，事件模型是 A2A SSE 和 tool calling 的共同基础
+Phase 3 — SQLite 持久化
+Phase 4 — 上下文压缩 + 结构化摘要（记忆系统）
+Phase 5 — SSE Streaming
+```
