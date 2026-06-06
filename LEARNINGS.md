@@ -158,3 +158,48 @@ Phase 3 — SQLite 持久化
 Phase 4 — 上下文压缩 + 结构化摘要（记忆系统）
 Phase 5 — SSE Streaming
 ```
+
+---
+
+## 2026-06-01 — 接入 M3 Provider（Anthropic Messages 多模态）
+
+### 背景
+MiniMax 发布 M3，定位"原生多模态 + 1M 上下文 + Frontier Coding + Agent"。
+q-body 当前默认 LLM 是 deepseek-v4-flash（走 OpenAI Chat Completions，无视觉能力）。
+老板让把 M3 加成 q-body 的 A2A provider。
+
+### 选型教训（重要）
+**第一次方案想"一步到位"做多 provider 架构重构 + 自动路由 + 难度判断。**
+老板一句"写死和列表配置有什么区别？"把我打醒了——
+
+- A 方案"列表配置"在 TOML 里也只是多写几行配置，切模型都要改文件+重启进程
+- 真实价值是 **fallback 兜底** 和 **按 task 选 provider**，但对当前 q-body 规模不成立
+- yoyo 经验也支持：渐进式比"一次到位架构"靠谱
+
+**最终走 B 最小方案**：加 M3 provider 独立段，不动现有 deepseek 路径。
+
+### 实现细节
+- `config.rs` — 新增 `M3Config` 块（`api_url`/`model`/`api_key_env`/`anthropic_version`/`max_tokens`）
+- `handler.rs` — 新增 `InferWithM3` A2A 方法 + `query_llm_m3` 走 Anthropic Messages 协议
+- A2A Part → Anthropic content blocks 的映射：
+  - `Part.text` → `{type:"text", text}`
+  - `Part.url + Part.mediaType` → 下载 URL → base64 → `{type:"image", source:{type:"base64", media_type, data}}`
+- 新依赖 `base64 = "0.22"`
+- systemd service 加 `Environment=MINIMAX_API_KEY=...`
+
+### 验证（全部通过 ✅）
+| Test | Provider | 结果 |
+|------|----------|------|
+| SendMessage | deepseek (OpenAI) | 401 旧 key 失效，跟 M3 改动无关 |
+| InferWithM3 (text) | M3 (Anthropic) | "我是 q-body v0.1.3，Q宝宝的自进化 Rust 小身板..." ✅ |
+| InferWithM3 (text+image url) | M3 (Anthropic) | 完整识别猫的毛色/眼睛/姿态 570字 ✅ |
+
+### 已知限制
+- M3 是**新增 method 不改 SendMessage**：外部必须显式调 `InferWithM3` 才能用 M3
+- 旧 ARK_API_KEY 失效是历史问题（service 文件 5月28日版本 vs config.yaml 5月之后），跟这次改动无关，需要单独修复
+- Anthropic response 可能含 `thinking` 块，当前实现只取 `text` 块（query_llm_m3:506）
+
+### 进化方向（进 yoyo 风格 Phase 计划）
+- 短期：SendMessage 加 `provider` 参数，外部可选 default/m3
+- 中期：自动路由器（看图/长文→M3，文本→deepseek，失败 fallback）
+- 长期：provider 抽象成 trait，配置驱动的 plugin 系统
