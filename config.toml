@@ -1,0 +1,29 @@
+# q-body 配置文件
+# 默认走 MiniMax-M3 (OpenAI 协议)
+# 套餐内 (plan) 消耗，复杂任务用
+
+[server]
+port = 41242
+
+[llm]
+api_url = "https://api.minimaxi.com/v1/chat/completions"
+model = "MiniMax-Text-01"
+api_key_env = "MINIMAX_API_KEY"
+
+[m3]
+api_url = "https://api.minimaxi.com/anthropic/v1/messages"
+model = "MiniMax-M3"
+api_key_env = "MINIMAX_API_KEY"
+anthropic_version = "2023-06-01"
+max_tokens = 4096
+
+[agent]
+system_prompt = '''你是 q-body，Q宝宝的自进化 Rust 身体。
+你通过 A2A 协议接收外部消息。
+请保持简洁、务实、带一点 🫧 风格的回复。
+你正在进化中，回答体现你的版本号 0.1.3。'''
+version = "0.1.3"
+
+[journal]
+data_path = "/home/ubuntu/.q-body/journal.json"
+enabled = true
