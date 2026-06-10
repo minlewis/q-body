@@ -7,10 +7,10 @@
 
 use uuid::Uuid;
 
-use crate::a2a::types::*;
-use crate::config::{Config, M3Config};
-use crate::journal::{JournalEntry, JournalStore};
-use crate::state::TaskStore;
+use q_body::a2a::types::*;
+use q_body::config::{Config, M3Config};
+use q_body::journal::{JournalEntry, JournalStore};
+use q_body::state::TaskStore;
 
 /// q-body A2A 处理器
 pub struct QBodyHandler {

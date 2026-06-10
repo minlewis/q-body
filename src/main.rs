@@ -27,17 +27,15 @@ use axum::{
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
-mod a2a;
-mod config;
 mod handler;
-mod journal;
-mod state;
 
-use a2a::types::*;
-use config::Config;
+// handler 模块依赖 AppState 等 binary 内部类型，保留 mod 声明在 main.rs
+// 其他模块通过 lib.rs 暴露：use q_body::xxx
+use q_body::a2a::types::*;
+use q_body::config::Config;
+use q_body::journal::JournalStore;
+use q_body::state::TaskStore;
 use handler::QBodyHandler;
-use journal::JournalStore;
-use state::TaskStore;
 
 /// 共享应用状态
 struct AppState {

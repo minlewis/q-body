@@ -21,11 +21,17 @@ pub struct Config {
 }
 
 /// 服务器配置
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// 监听端口
     #[serde(default = "default_port")]
     pub port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { port: default_port() }
+    }
 }
 
 fn default_port() -> u16 {
@@ -33,7 +39,7 @@ fn default_port() -> u16 {
 }
 
 /// LLM 配置
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
     /// API 端点 URL
     #[serde(default = "default_api_url")]
@@ -44,6 +50,16 @@ pub struct LlmConfig {
     /// 环境变量名，从中读取 API Key
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            api_url: default_api_url(),
+            model: default_model(),
+            api_key_env: default_api_key_env(),
+        }
+    }
 }
 
 fn default_api_url() -> String {
@@ -144,7 +160,7 @@ fn default_journal_enabled() -> bool {
 }
 
 /// Agent 配置
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     /// 系统提示词
     #[serde(default = "default_system_prompt")]
@@ -152,6 +168,15 @@ pub struct AgentConfig {
     /// Agent 版本号
     #[serde(default = "default_version")]
     pub version: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_system_prompt(),
+            version: default_version(),
+        }
+    }
 }
 
 fn default_system_prompt() -> String {
