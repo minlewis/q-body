@@ -246,3 +246,67 @@ impl QBodyHandler {
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构建最小测试 handler（无 ARK_API_KEY，query_llm 走 fallback，不触网）
+    fn make_handler() -> QBodyHandler {
+        let card = AgentCard {
+            name: "q-body-test".into(),
+            description: "test".into(),
+            url: None,
+            provider: None,
+            version: "0.0.0".into(),
+            capabilities: None,
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            supported_interfaces: vec![],
+        };
+        QBodyHandler::new(TaskStore::new(), card)
+    }
+
+    /// 未知方法 -> JSON-RPC -32601 method_not_found
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let h = make_handler();
+        let resp = h
+            .handle_request("BogusMethod", None, serde_json::json!(1))
+            .await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32601));
+        assert_eq!(resp["id"].as_i64(), Some(1));
+    }
+
+    /// ListTasks 无需参数 -> 成功，result.tasks 为数组
+    #[tokio::test]
+    async fn list_tasks_returns_success() {
+        let h = make_handler();
+        let resp = h
+            .handle_request("ListTasks", None, serde_json::json!(2))
+            .await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        assert!(resp["result"]["tasks"].is_array());
+    }
+
+    /// GetTask 缺参数 -> -32602 invalid_params
+    #[tokio::test]
+    async fn get_task_missing_params_returns_invalid_params() {
+        let h = make_handler();
+        let resp = h
+            .handle_request("GetTask", None, serde_json::json!(3))
+            .await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602));
+    }
+
+    /// 方法名归一化：tasks/get 与 GetTask 等价（缺参数 -> -32602）
+    #[tokio::test]
+    async fn method_alias_tasks_get_dispatches() {
+        let h = make_handler();
+        let resp = h
+            .handle_request("tasks/get", None, serde_json::json!(4))
+            .await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602));
+    }
+}
