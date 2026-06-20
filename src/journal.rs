@@ -135,6 +135,25 @@ impl Journal {
     pub fn total_events(&self) -> usize {
         self.events.len()
     }
+
+    /// 同一信号类型的事件是否已累计到去重/重构候选阈值（≥2 次即候选）。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — 当 skill-evolve counter 同类信号反复 bump
+    /// 时，把它视作小步清理（dedup/refactor）候选，避免重复模式持续累积无人收敛。
+    pub fn is_dedup_candidate(&self, signal: &EvolutionSignal) -> bool {
+        self.count_by_signal(signal) >= 2
+    }
+
+    /// 返回当前所有已达到去重/重构候选阈值（≥2 次）的信号类型。
+    ///
+    /// 用于每日 regression 检测：把同类高频信号集中暴露，提示下一轮回灌优先收敛。
+    pub fn dedup_candidates(&self) -> Vec<EvolutionSignal> {
+        use EvolutionSignal::*;
+        [Refactor, Dedup, Test, Perf, Bump]
+            .into_iter()
+            .filter(|s| self.is_dedup_candidate(s))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +237,51 @@ mod tests {
             complete.stage_text(EvolutionStage::Action),
             Some("added EvolutionStage enum + record_loop/count_by_stage")
         );
+    }
+
+    #[test]
+    fn test_dedup_candidate_threshold() {
+        let mut journal = Journal::new();
+
+        // 同类信号刚出现 1 次 → 不算候选
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-06-15".into(),
+            "extract handler error logic".into(),
+        );
+        assert!(!journal.is_dedup_candidate(&EvolutionSignal::Refactor));
+        assert!(journal.dedup_candidates().is_empty());
+
+        // 同类信号累计到 2 次 → 标记为 dedup/refactor 候选
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-06-15".into(),
+            "extract task parsing".into(),
+        );
+        assert!(journal.is_dedup_candidate(&EvolutionSignal::Refactor));
+
+        // 另一类信号刚出现 1 次 → 仍不算候选
+        journal.record(
+            EvolutionSignal::Test,
+            "session 2026-06-15".into(),
+            "add agent-card smoke test".into(),
+        );
+        assert!(!journal.is_dedup_candidate(&EvolutionSignal::Test));
+
+        // dedup_candidates 只列出已达阈值的类型
+        let candidates = journal.dedup_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], EvolutionSignal::Refactor);
+
+        // 第二类也累计到 2 次
+        journal.record(
+            EvolutionSignal::Test,
+            "session 2026-06-15".into(),
+            "add health smoke test".into(),
+        );
+        let candidates = journal.dedup_candidates();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&EvolutionSignal::Refactor));
+        assert!(candidates.contains(&EvolutionSignal::Test));
     }
 }
