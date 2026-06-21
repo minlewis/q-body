@@ -11,6 +11,7 @@
 //! 并用 .skill_evolve_counter 累计进化信号。
 
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 /// 进化信号类型
 #[derive(Debug, Clone, PartialEq)]
@@ -100,10 +101,24 @@ impl PredictionEntry {
 }
 
 /// Journal — 进化事件 + 预测/校验闭环存储
+///
+/// 06-21 扩展：增加 `cycle_id` + `seen_state`，提供 reset-cycle 语义防止
+/// 每日养料回灌把同一份 source 反复落到 Journal。
+///
+/// 借鉴来源：yologdev/yoyo-evolve — Day 112-113 的
+/// `social session (learnings + seen-state)` + `skill-evolve: reset counter (cycle ...)`
+/// 模式。yoyo 在每个进化周期边界处把 counter / seen-state 一起 reset，
+/// 配合一份 `seen-state` map 记录当前 cycle 内已处理过的事件，下一轮判重
+/// 直接查 map 而不是回扫整个 journal。
 #[derive(Debug, Clone)]
 pub struct Journal {
     events: Vec<EvolutionEvent>,
     predictions: Vec<PredictionEntry>,
+    /// 当前 cycle 起始时间戳（每次 `reset_cycle` 刷新到 now）。
+    cycle_id: DateTime<Utc>,
+    /// 当前 cycle 内已见过的事件 id → 最近一次 mark_seen 时间。
+    /// 每次 `reset_cycle` 整体清空。
+    seen_state: HashMap<String, DateTime<Utc>>,
 }
 
 impl Default for Journal {
@@ -117,6 +132,8 @@ impl Journal {
         Self {
             events: Vec::new(),
             predictions: Vec::new(),
+            cycle_id: Utc::now(),
+            seen_state: HashMap::new(),
         }
     }
 
@@ -233,6 +250,43 @@ impl Journal {
     /// 预测总数（pending + validated）。
     pub fn total_predictions(&self) -> usize {
         self.predictions.len()
+    }
+
+    /// 当前 cycle 起始时间戳。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — `skill-evolve: reset counter (cycle ...)`
+    /// 每个进化周期有显式起点，cycle_id 起观测与对账作用。
+    pub fn cycle_id(&self) -> DateTime<Utc> {
+        self.cycle_id
+    }
+
+    /// 把一个事件 id 标记为本 cycle 已见。重复 mark 会刷新 last_seen_at。
+    pub fn mark_seen(&mut self, event_id: impl Into<String>) {
+        self.seen_state.insert(event_id.into(), Utc::now());
+    }
+
+    /// 该事件 id 是否在当前 cycle 内已被 mark_seen 过。
+    ///
+    /// 配合每日养料回灌：cron 跑到一份 source 前先查这个，命中即跳过，
+    /// 避免在同一 cycle 内反复回灌相同养料。
+    pub fn was_seen_in_cycle(&self, event_id: &str) -> bool {
+        self.seen_state.contains_key(event_id)
+    }
+
+    /// 当前 cycle 内已见事件 id 的数量。
+    pub fn seen_count(&self) -> usize {
+        self.seen_state.len()
+    }
+
+    /// 进入下一个 cycle：刷新 `cycle_id` 到 now，并清空 `seen_state`。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — `skill-evolve: reset counter (cycle ...)`
+    /// 在 cycle 边界处把 counter / seen-state 一起 reset，让 cycle 之间相互独立。
+    /// 注意：进化事件 (`events`) 和预测条目 (`predictions`) 是 append-only 历史，
+    /// 不在 cycle 内被清空，只重置 cycle 边界 + 当前 cycle 的去重状态。
+    pub fn reset_cycle(&mut self) {
+        self.cycle_id = Utc::now();
+        self.seen_state.clear();
     }
 }
 
@@ -422,5 +476,62 @@ mod tests {
             .any(|p| p.prediction == "a2a/types.rs 下次会引入 dedup 候选");
         assert!(still_pending);
         assert_eq!(idx_b, 1);
+    }
+
+    #[test]
+    fn test_cycle_reset_and_seen_state() {
+        let mut journal = Journal::new();
+
+        let cycle_0 = journal.cycle_id();
+
+        // 初始：seen_state 为空，任何事件 id 都未被见过
+        assert_eq!(journal.seen_count(), 0);
+        assert!(!journal.was_seen_in_cycle("source-a"));
+
+        // 标记两条事件 id 为本 cycle 已见
+        journal.mark_seen("source-a");
+        journal.mark_seen("source-b");
+        assert_eq!(journal.seen_count(), 2);
+        assert!(journal.was_seen_in_cycle("source-a"));
+        assert!(journal.was_seen_in_cycle("source-b"));
+        assert!(!journal.was_seen_in_cycle("source-c"));
+
+        // 重复 mark 同一 id 不会增加去重表大小
+        journal.mark_seen("source-a");
+        assert_eq!(journal.seen_count(), 2);
+
+        // 落几条事件 / 一条预测，确认它们不会在 reset_cycle 时被清空
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-06-21".into(),
+            "extract dispatch helper".into(),
+        );
+        let pred_idx = journal.record_prediction("下次会出 dedup 候选".into());
+
+        // 等一小段时间确保 cycle_id 时间戳前进
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // 进入下一个 cycle
+        journal.reset_cycle();
+
+        // cycle_id 应向前推进
+        assert!(
+            journal.cycle_id() > cycle_0,
+            "reset_cycle 后 cycle_id 应严格大于上一轮 cycle_id"
+        );
+        // seen_state 已清空
+        assert_eq!(journal.seen_count(), 0);
+        assert!(!journal.was_seen_in_cycle("source-a"));
+        assert!(!journal.was_seen_in_cycle("source-b"));
+
+        // append-only 的历史不被清空
+        assert_eq!(journal.total_events(), 1);
+        assert_eq!(journal.total_predictions(), 1);
+        assert_eq!(pred_idx, 0);
+
+        // 新 cycle 可以再次标记同名事件，且不与上一 cycle 状态混淆
+        journal.mark_seen("source-a");
+        assert!(journal.was_seen_in_cycle("source-a"));
+        assert_eq!(journal.seen_count(), 1);
     }
 }
