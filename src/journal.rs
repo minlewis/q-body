@@ -73,10 +73,37 @@ impl EvolutionEvent {
     }
 }
 
-/// Journal — 进化事件存储
+/// 预测/校验闭环条目 — 把「当时的判断」与「事后实际结果」绑在同一条记录里。
+///
+/// 借鉴来源：yologdev/yoyo-evolve — Day 112 `/risk validate`。yoyo-evolve 用
+/// `/risk snapshot` 落盘预测、用 `/risk validate` 事后回 git 对账（哪些进了
+/// revert、哪些进了 fix），把「我以为会坏的」和「实际坏的」放在同一条对账记录
+/// 上展现 hits / misses。q-body 对应改法：单一结构 + `Option<>` 字段就地从
+/// 未校验切到已校验，避免双表/双查询，保证生命周期单调推进。
+///
+/// 本期只落最小数据结构 + 单测；A2A `journal_validate_prediction` skill 接线
+/// 属架构级改动，按 06-14 / 06-15 既定先例推迟到后续 PR。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictionEntry {
+    pub predicted_at: DateTime<Utc>,
+    pub prediction: String,
+    pub validated_at: Option<DateTime<Utc>>,
+    pub actual: Option<String>,
+    pub delta: Option<String>,
+}
+
+impl PredictionEntry {
+    /// 是否已经走完校验阶段（即 `actual` 已填）。
+    pub fn is_validated(&self) -> bool {
+        self.validated_at.is_some() && self.actual.is_some()
+    }
+}
+
+/// Journal — 进化事件 + 预测/校验闭环存储
 #[derive(Debug, Clone)]
 pub struct Journal {
     events: Vec<EvolutionEvent>,
+    predictions: Vec<PredictionEntry>,
 }
 
 impl Default for Journal {
@@ -87,7 +114,10 @@ impl Default for Journal {
 
 impl Journal {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            predictions: Vec::new(),
+        }
     }
 
     /// 记录一条进化事件（仅 Source / Suggestion 两阶段，action/verification 暂缺）。
@@ -153,6 +183,56 @@ impl Journal {
             .into_iter()
             .filter(|s| self.is_dedup_candidate(s))
             .collect()
+    }
+
+    /// 写入一条未校验的预测（≈ yoyo-evolve `/risk snapshot`）。
+    ///
+    /// 返回该预测在内部存储中的索引，后续可用 `validate_prediction` 回填校验结果。
+    pub fn record_prediction(&mut self, prediction: String) -> usize {
+        self.predictions.push(PredictionEntry {
+            predicted_at: Utc::now(),
+            prediction,
+            validated_at: None,
+            actual: None,
+            delta: None,
+        });
+        self.predictions.len() - 1
+    }
+
+    /// 事后回填预测的实际结果与 delta（≈ yoyo-evolve `/risk validate`）。
+    ///
+    /// 索引越界或该条已校验过时返回 `false`，避免覆盖既有对账记录。
+    pub fn validate_prediction(&mut self, idx: usize, actual: String, delta: String) -> bool {
+        match self.predictions.get_mut(idx) {
+            Some(entry) if entry.validated_at.is_none() => {
+                entry.validated_at = Some(Utc::now());
+                entry.actual = Some(actual);
+                entry.delta = Some(delta);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 还未校验的预测（snapshot 已落但 validate 还没回填）。
+    pub fn pending_predictions(&self) -> Vec<&PredictionEntry> {
+        self.predictions
+            .iter()
+            .filter(|p| !p.is_validated())
+            .collect()
+    }
+
+    /// 已校验完成的预测（用于后续 precision-at-N 等聚合分析的数据底座）。
+    pub fn validated_predictions(&self) -> Vec<&PredictionEntry> {
+        self.predictions
+            .iter()
+            .filter(|p| p.is_validated())
+            .collect()
+    }
+
+    /// 预测总数（pending + validated）。
+    pub fn total_predictions(&self) -> usize {
+        self.predictions.len()
     }
 }
 
@@ -283,5 +363,64 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert!(candidates.contains(&EvolutionSignal::Refactor));
         assert!(candidates.contains(&EvolutionSignal::Test));
+    }
+
+    #[test]
+    fn test_prediction_record_and_validate() {
+        let mut journal = Journal::new();
+
+        // 写入两条未校验的预测（≈ /risk snapshot）
+        let idx_a = journal.record_prediction("handler.rs 下次会被 refactor".into());
+        let idx_b = journal.record_prediction("a2a/types.rs 下次会引入 dedup 候选".into());
+
+        assert_eq!(journal.total_predictions(), 2);
+        assert_eq!(journal.pending_predictions().len(), 2);
+        assert_eq!(journal.validated_predictions().len(), 0);
+
+        let pending_a = &journal.pending_predictions()[0];
+        assert!(pending_a.validated_at.is_none());
+        assert!(pending_a.actual.is_none());
+        assert!(pending_a.delta.is_none());
+        assert!(!pending_a.is_validated());
+
+        // 校验第一条（≈ /risk validate） — 回填 actual / delta
+        let ok = journal.validate_prediction(
+            idx_a,
+            "handler.rs 被 dispatch 重构（hits）".into(),
+            "预测：refactor；实际：refactor → 命中".into(),
+        );
+        assert!(ok);
+
+        assert_eq!(journal.pending_predictions().len(), 1);
+        assert_eq!(journal.validated_predictions().len(), 1);
+
+        let validated = &journal.validated_predictions()[0];
+        assert!(validated.is_validated());
+        assert_eq!(
+            validated.actual.as_deref(),
+            Some("handler.rs 被 dispatch 重构（hits）")
+        );
+        assert_eq!(
+            validated.delta.as_deref(),
+            Some("预测：refactor；实际：refactor → 命中")
+        );
+        assert!(validated.validated_at.is_some());
+
+        // 已校验的条目不允许被二次覆盖
+        let twice = journal.validate_prediction(idx_a, "覆盖".into(), "覆盖".into());
+        assert!(!twice, "重复校验同一条预测应返回 false，避免覆盖对账记录");
+
+        // 越界索引应返回 false，且不影响存储
+        let out_of_range = journal.validate_prediction(999, "x".into(), "x".into());
+        assert!(!out_of_range);
+        assert_eq!(journal.total_predictions(), 2);
+
+        // 第二条仍处于 pending
+        let still_pending = journal
+            .pending_predictions()
+            .iter()
+            .any(|p| p.prediction == "a2a/types.rs 下次会引入 dedup 候选");
+        assert!(still_pending);
+        assert_eq!(idx_b, 1);
     }
 }
