@@ -142,6 +142,10 @@ pub struct Task {
     pub history: Option<Vec<Message>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<Artifact>>,
+    /// 该 Task 可用的 skill ID 列表；子 task 经 `TaskStore::create_sub_task` 继承父 task。
+    /// 借鉴 yoagent `SubAgentTool::with_skills`：父 agent 把 SkillSet 传给子 agent loop。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// 任务产出
