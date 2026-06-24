@@ -55,6 +55,11 @@ pub struct EvolutionEvent {
     pub action: Option<String>,
     /// 验证结果（闭环推进到 Verification 阶段后填入，如 "cargo test passed"）
     pub verification: Option<String>,
+    /// 该条目是否已被下游消费（None = 尚未消费）。
+    ///
+    /// 与 Journal 级 `seen_state`（按 event-id 字符串做 cycle 内粗粒度去重）互补：
+    /// `consumed_at` 做逐条目细粒度消费追踪，下游直接查 `unconsumed_events()` 拿待处理集合。
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 impl EvolutionEvent {
@@ -71,6 +76,11 @@ impl EvolutionEvent {
     /// 该事件是否已推进到指定阶段（即该阶段已有内容）。
     pub fn reached(&self, stage: EvolutionStage) -> bool {
         self.stage_text(stage).is_some()
+    }
+
+    /// 该条目是否已被下游消费（`consumed_at` 已填）。
+    pub fn is_consumed(&self) -> bool {
+        self.consumed_at.is_some()
     }
 }
 
@@ -146,6 +156,7 @@ impl Journal {
             suggestion,
             action: None,
             verification: None,
+            consumed_at: None,
         });
     }
 
@@ -165,6 +176,7 @@ impl Journal {
             suggestion,
             action: Some(action),
             verification: Some(verification),
+            consumed_at: None,
         });
     }
 
@@ -181,6 +193,28 @@ impl Journal {
     /// 返回事件总数
     pub fn total_events(&self) -> usize {
         self.events.len()
+    }
+
+    /// 标记指定索引的进化事件为已消费（填入 `consumed_at`）。
+    ///
+    /// 越界或已消费的条目返回 `false`，避免重复标记。
+    /// 与 `mark_seen` 互补：mark_seen 按 event-id 做 cycle 内去重，
+    /// mark_consumed 按索引做逐条目消费追踪。
+    pub fn mark_consumed(&mut self, idx: usize) -> bool {
+        match self.events.get_mut(idx) {
+            Some(event) if event.consumed_at.is_none() => {
+                event.consumed_at = Some(Utc::now());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 返回尚未消费的进化事件（`consumed_at` 为 None）。
+    ///
+    /// 下游消费方直接调这个拿到待处理集合，无需自己维护外部状态。
+    pub fn unconsumed_events(&self) -> Vec<&EvolutionEvent> {
+        self.events.iter().filter(|e| !e.is_consumed()).collect()
     }
 
     /// 同一信号类型的事件是否已累计到去重/重构候选阈值（≥2 次即候选）。
@@ -533,5 +567,61 @@ mod tests {
         journal.mark_seen("source-a");
         assert!(journal.was_seen_in_cycle("source-a"));
         assert_eq!(journal.seen_count(), 1);
+    }
+
+    #[test]
+    fn test_event_consumed_state() {
+        let mut journal = Journal::new();
+
+        // 落三条事件
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-06-24".into(),
+            "extract dispatch helper".into(),
+        );
+        journal.record(
+            EvolutionSignal::Test,
+            "session 2026-06-24".into(),
+            "add consumed-state test".into(),
+        );
+        journal.record_loop(
+            EvolutionSignal::Dedup,
+            "session 2026-06-24".into(),
+            "merge duplicate parsing".into(),
+            "merged two parse paths".into(),
+            "cargo test passed".into(),
+        );
+
+        // 初始：全部未消费
+        assert_eq!(journal.unconsumed_events().len(), 3);
+        assert!(!journal.events[0].is_consumed());
+
+        // 消费第一条
+        let ok = journal.mark_consumed(0);
+        assert!(ok);
+        assert!(journal.events[0].is_consumed());
+        assert!(journal.events[0].consumed_at.is_some());
+        assert_eq!(journal.unconsumed_events().len(), 2);
+
+        // 重复消费同一条 → false
+        let twice = journal.mark_consumed(0);
+        assert!(!twice);
+
+        // 消费第二条
+        assert!(journal.mark_consumed(1));
+        assert_eq!(journal.unconsumed_events().len(), 1);
+
+        // 越界索引 → false
+        assert!(!journal.mark_consumed(999));
+
+        // 第三条仍未消费
+        let remaining = journal.unconsumed_events();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].signal, EvolutionSignal::Dedup);
+
+        // consumed_at 不被 reset_cycle 清空（与 append-only 历史一致）
+        journal.reset_cycle();
+        assert!(journal.events[0].is_consumed());
+        assert_eq!(journal.unconsumed_events().len(), 1);
     }
 }
