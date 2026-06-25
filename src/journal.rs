@@ -110,6 +110,29 @@ impl PredictionEntry {
     }
 }
 
+/// 周期评估条目 — 在进化周期边界处对本周期的 suggestion 有效性、prediction 命中率
+/// 与下周期方向做一次结构化总结。
+///
+/// 借鉴来源：yologdev/yoyo-evolve — assessment 步骤。yoyo-evolve 在每个进化周期
+/// 末尾做一次 assessment：统计本周期 suggestion 里哪些有效 / 哪些无效、回看
+/// prediction 的命中情况（与 Day 112 `/risk validate` 的 hits vs misses 对账），
+/// 并据此定下下一周期的方向——这是 Source→Suggestion→Action→Verification 闭环
+/// 之后的收口。q-body 对应改法：单一结构把「这轮学到了什么、下轮往哪走」落盘成
+/// 一条可回溯的评估记录；`prediction_hit_rate` 用 `Option<f64>`（无已校验
+/// prediction 时为 None），与 `PredictionEntry` 的「未校验→已校验」生命周期对齐。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssessmentEntry {
+    pub assessed_at: DateTime<Utc>,
+    /// 本周期内有效的 suggestion 数
+    pub effective_suggestions: usize,
+    /// 本周期内无效的 suggestion 数
+    pub ineffective_suggestions: usize,
+    /// prediction 命中率（已校验预测中命中的比例）；无已校验预测时为 None。
+    pub prediction_hit_rate: Option<f64>,
+    /// 下一周期方向
+    pub next_direction: String,
+}
+
 /// Journal — 进化事件 + 预测/校验闭环存储
 ///
 /// 06-21 扩展：增加 `cycle_id` + `seen_state`，提供 reset-cycle 语义防止
@@ -124,6 +147,8 @@ impl PredictionEntry {
 pub struct Journal {
     events: Vec<EvolutionEvent>,
     predictions: Vec<PredictionEntry>,
+    /// 周期评估记录（每个进化周期边界处落盘一条，append-only）。
+    assessments: Vec<AssessmentEntry>,
     /// 当前 cycle 起始时间戳（每次 `reset_cycle` 刷新到 now）。
     cycle_id: DateTime<Utc>,
     /// 当前 cycle 内已见过的事件 id → 最近一次 mark_seen 时间。
@@ -142,6 +167,7 @@ impl Journal {
         Self {
             events: Vec::new(),
             predictions: Vec::new(),
+            assessments: Vec::new(),
             cycle_id: Utc::now(),
             seen_state: HashMap::new(),
         }
@@ -321,6 +347,37 @@ impl Journal {
     pub fn reset_cycle(&mut self) {
         self.cycle_id = Utc::now();
         self.seen_state.clear();
+    }
+
+    /// 记录一条周期评估（≈ yoyo-evolve assessment 步骤）。
+    ///
+    /// 在周期边界处把本周期 suggestion 有效性、prediction 命中率与下周期方向
+    /// 结构化落盘，作为 Source→Suggestion→Action→Verification 闭环之后的收口。
+    /// 评估记录是 append-only，不随 `reset_cycle` 清空（与 events / predictions 一致）。
+    pub fn record_assessment(
+        &mut self,
+        effective_suggestions: usize,
+        ineffective_suggestions: usize,
+        prediction_hit_rate: Option<f64>,
+        next_direction: String,
+    ) {
+        self.assessments.push(AssessmentEntry {
+            assessed_at: Utc::now(),
+            effective_suggestions,
+            ineffective_suggestions,
+            prediction_hit_rate,
+            next_direction,
+        });
+    }
+
+    /// 返回所有周期评估记录（按落盘顺序）。
+    pub fn assessments(&self) -> &[AssessmentEntry] {
+        &self.assessments
+    }
+
+    /// 评估记录总数。
+    pub fn total_assessments(&self) -> usize {
+        self.assessments.len()
     }
 }
 
@@ -623,5 +680,30 @@ mod tests {
         journal.reset_cycle();
         assert!(journal.events[0].is_consumed());
         assert_eq!(journal.unconsumed_events().len(), 1);
+    }
+
+    #[test]
+    fn test_assessment_record() {
+        let mut journal = Journal::new();
+
+        // 第一周期：2 有效 / 1 无效，prediction 命中率 0.5，方向：收敛 dedup
+        journal.record_assessment(2, 1, Some(0.5), "收敛 dedup 候选".into());
+        assert_eq!(journal.total_assessments(), 1);
+
+        let a = &journal.assessments()[0];
+        assert_eq!(a.effective_suggestions, 2);
+        assert_eq!(a.ineffective_suggestions, 1);
+        assert_eq!(a.prediction_hit_rate, Some(0.5));
+        assert_eq!(a.next_direction, "收敛 dedup 候选");
+        assert!(a.assessed_at <= Utc::now());
+
+        // 第二周期：尚无已校验 prediction → hit_rate = None
+        journal.record_assessment(0, 0, None, "积攒更多 prediction 样本".into());
+        assert_eq!(journal.total_assessments(), 2);
+        assert_eq!(journal.assessments()[1].prediction_hit_rate, None);
+
+        // reset_cycle 不清空 append-only 的评估记录（与 events / predictions 一致）
+        journal.reset_cycle();
+        assert_eq!(journal.total_assessments(), 2);
     }
 }
