@@ -14,6 +14,17 @@ use crate::state::TaskStore;
 const LLM_API_URL: &str = "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions";
 const LLM_MODEL: &str = "deepseek-v4-flash";
 
+/// Serialize to `serde_json::Value` with graceful fallback — never panics.
+///
+/// 借鉴：yologdev/yoyo-evolve error-recovery — 用 `unwrap_or_else` + `tracing::error!`
+/// 替代 `.unwrap()`，序列化失败时记录日志并返回 `Value::Null` 而非 panic。
+fn to_json<T: serde::Serialize>(v: T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or_else(|e| {
+        tracing::error!("JSON 序列化失败: {e}");
+        serde_json::Value::Null
+    })
+}
+
 /// q-body A2A 处理器
 pub struct QBodyHandler {
     pub task_store: TaskStore,
@@ -48,8 +59,7 @@ impl QBodyHandler {
             "ListTasks" | "tasks/list" => {
                 self.handle_list_tasks(params, request_id).await
             }
-            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method))
-                .unwrap(),
+            _ => to_json(JsonRpcError::method_not_found(request_id, method)),
         }
     }
 
@@ -65,11 +75,10 @@ impl QBodyHandler {
         {
             Some(r) => r,
             None => {
-                return serde_json::to_value(JsonRpcError::invalid_params(
+                return to_json(JsonRpcError::invalid_params(
                     request_id,
                     "missing or invalid SendMessage params",
-                ))
-                .unwrap();
+                ));
             }
         };
 
@@ -120,13 +129,12 @@ impl QBodyHandler {
         match self.task_store.get_task(&task_id).await {
             Some(task) => {
                 let resp = SendMessageResponse::from_task(&task);
-                serde_json::to_value(JsonRpcResponse::success(request_id, resp)).unwrap()
+                to_json(JsonRpcResponse::success(request_id, resp))
             }
-            None => serde_json::to_value(JsonRpcError::internal(
+            None => to_json(JsonRpcError::internal(
                 request_id,
                 "task not found after creation",
-            ))
-            .unwrap(),
+            )),
         }
     }
 
@@ -212,24 +220,22 @@ impl QBodyHandler {
         {
             Some(r) => r,
             None => {
-                return serde_json::to_value(JsonRpcError::invalid_params(
+                return to_json(JsonRpcError::invalid_params(
                     request_id,
                     "missing or invalid GetTask params",
-                ))
-                .unwrap();
+                ));
             }
         };
 
         match self.task_store.get_task(&req.id).await {
             Some(task) => {
                 let resp = GetTaskResponse::from_task(&task);
-                serde_json::to_value(JsonRpcResponse::success(request_id, resp)).unwrap()
+                to_json(JsonRpcResponse::success(request_id, resp))
             }
-            None => serde_json::to_value(JsonRpcError::invalid_params(
+            None => to_json(JsonRpcError::invalid_params(
                 request_id,
                 &format!("task not found: {}", req.id),
-            ))
-            .unwrap(),
+            )),
         }
     }
 
@@ -243,6 +249,29 @@ impl QBodyHandler {
             "tasks": [],
             "nextPageToken": null,
         });
-        serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
+        to_json(JsonRpcResponse::success(request_id, result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_json_valid() {
+        let v = to_json(serde_json::json!({"ok": true}));
+        assert_eq!(v["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_to_json_fallback_no_panic() {
+        struct AlwaysFail;
+        impl serde::Serialize for AlwaysFail {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("intentional failure"))
+            }
+        }
+        let v = to_json(AlwaysFail);
+        assert_eq!(v, serde_json::Value::Null);
     }
 }
