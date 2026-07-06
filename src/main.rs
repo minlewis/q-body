@@ -37,7 +37,7 @@ use state::TaskStore;
 
 /// 共享应用状态
 struct AppState {
-    handler: QBodyHandler,
+    handler: Arc<QBodyHandler>,
 }
 
 // ============================================================

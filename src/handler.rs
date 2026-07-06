@@ -1,13 +1,19 @@
 //! A2A Handler — q-body 的 A2A 请求处理核心
 //!
-//! 实现了 JSON-RPC method 分发：
+//! 实现了 JSON-RPC method 分发（通过 HandlerRegistry 动态注册）：
 //! - SendMessage：创建 Task，通过 LLM 处理消息，返回结果
 //! - GetTask：查询 Task 状态
 //! - ListTasks: 列出所有 Task
+//!
+//! 借鉴：IBM/mcp-context-forge — registry + proxy 动态路由架构
+
+use std::future::Future;
+use std::sync::{Arc, Weak};
 
 use uuid::Uuid;
 
 use crate::a2a::types::*;
+use crate::registry::{HandlerFn, HandlerRegistry};
 use crate::state::TaskStore;
 
 /// 火山引擎 deepseek-v4-flash 的 API 端点
@@ -20,37 +26,67 @@ pub struct QBodyHandler {
     pub agent_card: AgentCard,
     /// HTTP 客户端（复用连接，避免每次新建）
     http_client: reqwest::Client,
+    /// 动态方法注册表（替代静态 match 分发）
+    registry: HandlerRegistry,
 }
 
 impl QBodyHandler {
-    pub fn new(task_store: TaskStore, agent_card: AgentCard) -> Self {
-        Self {
-            task_store,
-            agent_card,
-            http_client: reqwest::Client::new(),
-        }
+    /// 构造 QBodyHandler 并返回 Arc<Self>
+    ///
+    /// 使用 Arc::new_cyclic 创建自引用结构：每个 handler_fn 闭包捕获
+    /// Weak<QBodyHandler>，在调用时升级为 Arc 以访问内部方法。
+    /// 这样 HandlerRegistry 的 dispatch 真正替代了静态 match 分发。
+    pub fn new(task_store: TaskStore, agent_card: AgentCard) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| {
+            let mut registry = HandlerRegistry::new();
+
+            // SendMessage — 注册 "SendMessage" 和 "message/send" 两个别名
+            let weak1 = weak_self.clone();
+            registry.register("SendMessage", make_handler_fn(weak1, |this, p, id| {
+                Box::pin(async move { this.handle_send_message(p, id).await })
+            }));
+            let weak2 = weak_self.clone();
+            registry.register("message/send", make_handler_fn(weak2, |this, p, id| {
+                Box::pin(async move { this.handle_send_message(p, id).await })
+            }));
+
+            // GetTask — 注册 "GetTask" 和 "tasks/get"
+            let weak3 = weak_self.clone();
+            registry.register("GetTask", make_handler_fn(weak3, |this, p, id| {
+                Box::pin(async move { this.handle_get_task(p, id).await })
+            }));
+            let weak4 = weak_self.clone();
+            registry.register("tasks/get", make_handler_fn(weak4, |this, p, id| {
+                Box::pin(async move { this.handle_get_task(p, id).await })
+            }));
+
+            // ListTasks — 注册 "ListTasks" 和 "tasks/list"
+            let weak5 = weak_self.clone();
+            registry.register("ListTasks", make_handler_fn(weak5, |this, p, id| {
+                Box::pin(async move { this.handle_list_tasks(p, id).await })
+            }));
+            let weak6 = weak_self.clone();
+            registry.register("tasks/list", make_handler_fn(weak6, |this, p, id| {
+                Box::pin(async move { this.handle_list_tasks(p, id).await })
+            }));
+
+            QBodyHandler {
+                task_store,
+                agent_card,
+                http_client: reqwest::Client::new(),
+                registry,
+            }
+        })
     }
 
-    /// 处理 JSON-RPC 请求分发
+    /// 处理 JSON-RPC 请求分发 — 通过 HandlerRegistry 动态分发
     pub async fn handle_request(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
-        match method {
-            "SendMessage" | "message/send" => {
-                self.handle_send_message(params, request_id).await
-            }
-            "GetTask" | "tasks/get" => {
-                self.handle_get_task(params, request_id).await
-            }
-            "ListTasks" | "tasks/list" => {
-                self.handle_list_tasks(params, request_id).await
-            }
-            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method))
-                .unwrap(),
-        }
+        self.registry.dispatch(method, params, request_id).await
     }
 
     /// 处理 SendMessage：接收消息 → 创建 Task → 调 LLM → 返回结果
@@ -245,4 +281,39 @@ impl QBodyHandler {
         });
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
     }
+}
+
+/// 辅助：创建 HandlerFn，从 Weak<QBodyHandler> 升级为 Arc 后调用方法
+///
+/// 避免重复编写 Weak::upgrade + 错误处理的样板代码。
+/// `f` 接收 Arc<QBodyHandler> + params + request_id，返回一个 Future。
+fn make_handler_fn<F, Fut>(weak: Weak<QBodyHandler>, f: F) -> HandlerFn
+where
+    F: Fn(Arc<QBodyHandler>, Option<serde_json::Value>, serde_json::Value) -> Fut
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = serde_json::Value> + Send + 'static,
+{
+    Arc::new(move |params, id| {
+        let f = f.clone();
+        let weak = weak.clone();
+        Box::pin(async move {
+            match weak.upgrade() {
+                Some(this) => f(this, params, id).await,
+                None => serde_json::to_value(JsonRpcError::internal(
+                    id,
+                    "handler dropped during execution",
+                ))
+                .unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32603, "message": "Internal error" },
+                        "id": null,
+                    })
+                }),
+            }
+        })
+    })
 }
