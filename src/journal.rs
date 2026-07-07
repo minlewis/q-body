@@ -11,10 +11,12 @@
 //! 并用 .skill_evolve_counter 累计进化信号。
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{self, Write};
 
 /// 进化信号类型
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EvolutionSignal {
     /// 重构信号
     Refactor,
@@ -32,7 +34,7 @@ pub enum EvolutionSignal {
 ///
 /// 对应每日养料回灌的完整生命周期：养料从哪来 → 建议怎么改 → 实际改了什么 → 是否验证通过。
 /// 用于把回灌闭环结构化落盘，并为后续 dedup/refactor 候选检测（同类事件≥2 次）提供按阶段计数能力。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvolutionStage {
     /// 养料来源
     Source,
@@ -45,7 +47,7 @@ pub enum EvolutionStage {
 }
 
 /// 单条进化事件记录
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionEvent {
     pub timestamp: DateTime<Utc>,
     pub signal: EvolutionSignal,
@@ -94,7 +96,7 @@ impl EvolutionEvent {
 ///
 /// 本期只落最小数据结构 + 单测；A2A `journal_validate_prediction` skill 接线
 /// 属架构级改动，按 06-14 / 06-15 既定先例推迟到后续 PR。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionEntry {
     pub predicted_at: DateTime<Utc>,
     pub prediction: String,
@@ -120,7 +122,7 @@ impl PredictionEntry {
 /// 之后的收口。q-body 对应改法：单一结构把「这轮学到了什么、下轮往哪走」落盘成
 /// 一条可回溯的评估记录；`prediction_hit_rate` 用 `Option<f64>`（无已校验
 /// prediction 时为 None），与 `PredictionEntry` 的「未校验→已校验」生命周期对齐。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssessmentEntry {
     pub assessed_at: DateTime<Utc>,
     /// 本周期内有效的 suggestion 数
@@ -143,7 +145,7 @@ pub struct AssessmentEntry {
 /// 模式。yoyo 在每个进化周期边界处把 counter / seen-state 一起 reset，
 /// 配合一份 `seen-state` map 记录当前 cycle 内已处理过的事件，下一轮判重
 /// 直接查 map 而不是回扫整个 journal。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
     events: Vec<EvolutionEvent>,
     predictions: Vec<PredictionEntry>,
@@ -378,6 +380,114 @@ impl Journal {
     /// 评估记录总数。
     pub fn total_assessments(&self) -> usize {
         self.assessments.len()
+    }
+
+    /// 将整个 Journal 以 JSONL 格式持久化到指定文件。
+    ///
+    /// JSONL 格式：每行一条独立的 JSON 记录。
+    /// 写入顺序：events 行 → predictions 行 → assessments 行 → journal metadata 行。
+    /// 写入是原子性的：先写入临时文件，成功后 rename 到目标路径。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — Day 129 `/risk validate` JSONL 持久化模式。
+    /// yoyo-evolve 把 journal 数据以 JSONL append-only 写入文件，每行一条独立 JSON，
+    /// 天然支持增量追加、无需锁或事务。
+    pub fn persist_to_jsonl(&self, path: &str) -> io::Result<()> {
+        let tmp_path = format!("{}.tmp", path);
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            // events
+            for event in &self.events {
+                let line = serde_json::to_string(event)?;
+                writeln!(file, "{}", line)?;
+            }
+            // predictions
+            for pred in &self.predictions {
+                let line = serde_json::to_string(pred)?;
+                writeln!(file, "{}", line)?;
+            }
+            // assessments
+            for assessment in &self.assessments {
+                let line = serde_json::to_string(assessment)?;
+                writeln!(file, "{}", line)?;
+            }
+            // journal metadata — write a single "Journal" row with meta fields
+            let meta = serde_json::json!({
+                "type": "__journal_meta__",
+                "cycle_id": self.cycle_id,
+                "seen_state": self.seen_state,
+            });
+            let line = serde_json::to_string(&meta)?;
+            writeln!(file, "{}", line)?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// 从 JSONL 文件加载 Journal 数据。
+    ///
+    /// 逐行反序列化：events 行 → PredictionEntry → AssessmentEntry → meta 行（Journal）。
+    /// 如果文件不存在，返回一个空的 Journal（不报错，方便首次使用）。
+    ///
+    /// 借鉴来源同 `persist_to_jsonl` — yologdev/yoyo-evolve Day 129 JSONL 持久化。
+    pub fn load_from_jsonl(path: &str) -> io::Result<Self> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::new());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut events = Vec::new();
+        let mut predictions = Vec::new();
+        let mut assessments = Vec::new();
+        let mut cycle_id = Utc::now();
+        let mut seen_state = HashMap::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Try to parse as journal metadata
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if val.get("type").and_then(|t| t.as_str()) == Some("__journal_meta__") {
+                    if let Some(cid) = val.get("cycle_id").and_then(|v| v.as_str()) {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(cid) {
+                            cycle_id = dt.with_timezone(&Utc);
+                        }
+                    }
+                    if let Some(ss) = val.get("seen_state").and_then(|v| v.as_object()) {
+                        for (k, v) in ss {
+                            if let Some(ts) = v.as_str() {
+                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                                    seen_state.insert(k.clone(), dt.with_timezone(&Utc));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Skip type markers not recognized
+            }
+
+            // Try each type in order
+            if let Ok(event) = serde_json::from_str::<EvolutionEvent>(line) {
+                events.push(event);
+            } else if let Ok(pred) = serde_json::from_str::<PredictionEntry>(line) {
+                predictions.push(pred);
+            } else if let Ok(assessment) = serde_json::from_str::<AssessmentEntry>(line) {
+                assessments.push(assessment);
+            }
+        }
+
+        Ok(Self {
+            events,
+            predictions,
+            assessments,
+            cycle_id,
+            seen_state,
+        })
     }
 }
 
@@ -705,5 +815,101 @@ mod tests {
         // reset_cycle 不清空 append-only 的评估记录（与 events / predictions 一致）
         journal.reset_cycle();
         assert_eq!(journal.total_assessments(), 2);
+    }
+
+    #[test]
+    fn test_persist_and_load_jsonl_roundtrip() {
+        let mut journal = Journal::new();
+
+        // 落几条事件、两条预测、一条评估
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-07-07".into(),
+            "add JSONL persistence".into(),
+        );
+        journal.record_loop(
+            EvolutionSignal::Test,
+            "session 2026-07-07".into(),
+            "add roundtrip test".into(),
+            "added test_persist_and_load_jsonl_roundtrip".into(),
+            "cargo test passed".into(),
+        );
+        let pred_idx = journal.record_prediction("下次会加 data-driven 测试".into());
+        journal.validate_prediction(pred_idx, "roundtrip test added".into(), "预测：data-driven；实际：roundtrip → 接近".into());
+        journal.record_assessment(2, 0, Some(0.8), "JSONL 持久化+更完善 data-driven".into());
+
+        // 标记 seen_state
+        journal.mark_seen("source-a");
+        journal.mark_seen("source-b");
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_journal_{}.jsonl", timestamp);
+
+        // persist
+        journal.persist_to_jsonl(&path).expect("persist should succeed");
+
+        // 验证文件存在且非空
+        let content = std::fs::read_to_string(&path).expect("should read file");
+        assert!(!content.is_empty(), "JSONL file should not be empty");
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 5, "2 events + 1 prediction + 1 assessment + 1 meta = 5 lines");
+
+        // load
+        let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
+
+        // 验证内容一致性
+        assert_eq!(loaded.total_events(), 2);
+        assert_eq!(loaded.total_predictions(), 1);
+        assert_eq!(loaded.total_assessments(), 1);
+
+        // 事件内容
+        let loaded_refactor = loaded.events.iter().find(|e| e.signal == EvolutionSignal::Refactor);
+        assert!(loaded_refactor.is_some());
+        assert_eq!(loaded_refactor.unwrap().source, "session 2026-07-07");
+
+        // 预测
+        let loaded_pred = &loaded.predictions[0];
+        assert!(loaded_pred.is_validated());
+        assert_eq!(loaded_pred.actual.as_deref(), Some("roundtrip test added"));
+
+        // 评估
+        assert_eq!(loaded.assessments[0].effective_suggestions, 2);
+        assert_eq!(loaded.assessments[0].prediction_hit_rate, Some(0.8));
+
+        // seen_state 持久化
+        assert!(loaded.was_seen_in_cycle("source-a"));
+        assert!(loaded.was_seen_in_cycle("source-b"));
+        assert!(!loaded.was_seen_in_cycle("source-c"));
+        assert_eq!(loaded.seen_count(), 2);
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_jsonl_file_not_found_returns_empty() {
+        let journal = Journal::load_from_jsonl("/tmp/nonexistent_journal.jsonl")
+            .expect("missing file should return empty journal");
+        assert_eq!(journal.total_events(), 0);
+        assert_eq!(journal.total_predictions(), 0);
+        assert_eq!(journal.total_assessments(), 0);
+        assert_eq!(journal.seen_count(), 0);
+    }
+
+    #[test]
+    fn test_persist_and_load_empty_journal() {
+        let journal = Journal::new();
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_empty_journal_{}.jsonl", timestamp);
+
+        journal.persist_to_jsonl(&path).expect("persist empty journal should succeed");
+
+        let loaded = Journal::load_from_jsonl(&path).expect("load empty journal should succeed");
+        assert_eq!(loaded.total_events(), 0);
+        assert_eq!(loaded.total_predictions(), 0);
+        assert_eq!(loaded.total_assessments(), 0);
+        assert_eq!(loaded.seen_count(), 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
