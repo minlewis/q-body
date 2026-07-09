@@ -246,3 +246,133 @@ impl QBodyHandler {
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
     }
 }
+
+// ============================================================
+// Prompt 分解 — 检测复合任务，拆分子任务
+// ============================================================
+
+/// 子任务类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubTaskKind {
+    /// 独立可并行执行的任务
+    Independent,
+    /// 依赖前置结果的任务
+    Sequential,
+}
+
+/// 一个分解后的子任务
+#[derive(Debug, Clone)]
+pub struct SubTask {
+    pub id: usize,
+    pub description: String,
+    pub kind: SubTaskKind,
+}
+
+/// 检测 prompt 是否包含复合任务标记，并分解为子任务
+///
+/// 借鉴：yologdev/yoyo-evolve — Day 130 `Wire detect_parallelizable_tasks into /spawn`
+/// yoyo 在检测到复合任务关键词后自动拆分子任务，以 JSON-RPC batch 并行发送。
+/// q-body 对应：启发式关键词检测 + 分句拆分，类型层准备。
+pub fn decompose_task(prompt: &str) -> Vec<SubTask> {
+    let prompt_lower = prompt.to_lowercase();
+
+    // 检测多任务关键词
+    let multi_task_keywords = [
+        "分步", "步骤", "同时", "并行", "分别",
+        "parallel", "step by step", "meanwhile", "concurrently",
+    ];
+    let has_multi_task = multi_task_keywords
+        .iter()
+        .any(|kw| prompt_lower.contains(kw));
+
+    if !has_multi_task {
+        // 单任务：直接返回
+        return vec![SubTask {
+            id: 1,
+            description: prompt.to_string(),
+            kind: SubTaskKind::Independent,
+        }];
+    }
+
+    // 按换行、句号、分号、数字编号拆分子句
+    let separators = ["\n", "\r\n", "。", ";", "；"];
+    let mut raw = prompt.to_string();
+    for sep in &separators {
+        raw = raw.replace(sep, "\x00");
+    }
+
+    let sentences: Vec<&str> = raw
+        .split('\x00')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if sentences.len() <= 1 {
+        return vec![SubTask {
+            id: 1,
+            description: prompt.to_string(),
+            kind: SubTaskKind::Independent,
+        }];
+    }
+
+    sentences
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| SubTask {
+            id: i + 1,
+            description: s.to_string(),
+            kind: SubTaskKind::Independent,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_single_task_no_keyword() {
+        let result = decompose_task("请帮我写一首诗");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    #[test]
+    fn test_single_task_english() {
+        let result = decompose_task("write a python script");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_keyword_cn() {
+        let result = decompose_task("请同时做三件事：分析数据。生成报告。发送邮件");
+        assert!(result.len() >= 2, "should decompose into sub-tasks: got {}", result.len());
+    }
+
+    #[test]
+    fn test_parallel_keyword_en() {
+        let result = decompose_task("parallel: analyze the code and write tests");
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn test_step_by_step() {
+        let result = decompose_task("step by step: parse the input, validate it, then process");
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn test_sub_task_has_ids() {
+        let result = decompose_task("分步做：先检查。再执行。最后验证");
+        assert_eq!(result[0].id, 1);
+        assert_eq!(result[1].id, 2);
+    }
+
+    #[test]
+    fn test_sub_task_kind_independent() {
+        let result = decompose_task("同时处理：报告和图表");
+        for sub in &result {
+            assert_eq!(sub.kind, SubTaskKind::Independent);
+        }
+    }
+}
