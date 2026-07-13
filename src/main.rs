@@ -27,6 +27,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 mod a2a;
+mod config;
 mod handler;
 mod state;
 
@@ -142,7 +143,8 @@ async fn main() {
     };
 
     let task_store = TaskStore::new();
-    let handler = QBodyHandler::new(task_store, agent_card);
+    let timeout_config = config::TimeoutConfig::from_env();
+    let handler = QBodyHandler::new(task_store, agent_card, timeout_config);
 
     let state = Arc::new(AppState { handler });
 

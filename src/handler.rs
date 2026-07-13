@@ -8,6 +8,7 @@
 use uuid::Uuid;
 
 use crate::a2a::types::*;
+use crate::config::TimeoutConfig;
 use crate::state::TaskStore;
 
 /// 火山引擎 deepseek-v4-flash 的 API 端点
@@ -18,16 +19,23 @@ const LLM_MODEL: &str = "deepseek-v4-flash";
 pub struct QBodyHandler {
     pub task_store: TaskStore,
     pub agent_card: AgentCard,
+    /// 超时配置
+    pub timeout_config: TimeoutConfig,
     /// HTTP 客户端（复用连接，避免每次新建）
     http_client: reqwest::Client,
 }
 
 impl QBodyHandler {
-    pub fn new(task_store: TaskStore, agent_card: AgentCard) -> Self {
+    pub fn new(task_store: TaskStore, agent_card: AgentCard, timeout_config: TimeoutConfig) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(timeout_config.http_timeout)
+            .build()
+            .expect("Failed to build reqwest::Client");
         Self {
             task_store,
             agent_card,
-            http_client: reqwest::Client::new(),
+            timeout_config,
+            http_client,
         }
     }
 
