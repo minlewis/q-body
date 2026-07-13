@@ -64,7 +64,10 @@ async fn jsonrpc_handler(
                 req.id,
                 "jsonrpc must be 2.0",
             ))
-            .unwrap()),
+            .unwrap_or_else(|e| {
+                tracing::error!("JSON 序列化失败: {e}");
+                serde_json::Value::Null
+            })),
         );
     }
 
@@ -170,6 +173,14 @@ async fn main() {
     tracing::info!("   JSON-RPC:   http://{addr}/a2a/jsonrpc");
     tracing::info!("{sep}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("端口绑定失败 {addr}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("服务器异常退出: {e}");
+    }
 }
