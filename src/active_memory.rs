@@ -1,11 +1,21 @@
 //! Active Memory — q-body 的记忆合成模块
 //!
-//! 借鉴：yologdev/yoyo-evolve — `synthesize: regenerate active memory context`
+//! # 设计原则
 //!
-//! yoyo-evolve 在每个 task 入口前从持久化记忆中读取最近活跃记录，
-//! 合成 "active memory context" 注入 LLM system prompt。
-//! q-body 对应：MemoryEntry / ActiveMemory struct + synthesize() 方法，
-//! 从 `~/.hermes/q-body-memory/` 读取 JSONL 记忆文件。
+//! `synthesize()` 是本模块的**首要入口**（primary step）。
+//! 调用方只需调用 `synthesize()`，内部自动完成：
+//!
+//! 1. 从 JSONL 持久化文件加载最新记忆
+//! 2. 合成格式化上下文摘要
+//!
+//! 调用方**无需**关心数据从哪里来、如何加载。
+//!
+//! # 借鉴
+//!
+//! yologdev/yoyo-evolve — `synthesize: regenerate active memory context`
+//! yoyo-evolve 的 active memory 模块中，`synthesize()` 是唯一的对外 API：
+//! 调用时自动从持久化文件加载最新记忆、合成 context 注入 LLM prompt。
+//! 设计哲学：**调用方不该知道数据从哪里来**——synthesize 内部完成加载链，外部只需一个方法调用。
 
 use std::path::PathBuf;
 
@@ -147,13 +157,24 @@ impl ActiveMemory {
         Ok(())
     }
 
-    /// 合成活跃记忆上下文摘要
+    /// 合成活跃记忆上下文摘要（**首要入口**）
+    ///
+    /// 调用时自动从持久化 JSONL 文件加载最新记忆，然后合成格式化上下文摘要。
+    /// 调用方无需关心数据从哪里来——这是本模块推荐使用的唯一方法。
     ///
     /// 返回格式化的文本摘要，包含最近 N 条记忆的关键信息。
     /// 适用于注入 LLM system prompt 作为上下文。
-    pub fn synthesize(&self) -> String {
+    ///
+    /// # 错误
+    ///
+    /// 如果 JSONL 文件存在但读取失败，返回 Err 描述错误原因。
+    /// 如果文件不存在或为空，返回 Ok("No active memory available.")。
+    pub fn synthesize(&mut self) -> Result<String, String> {
+        // 先加载持久化记忆（首要步骤）
+        let _ = self.load_from_jsonl()?;
+
         if self.entries.is_empty() {
-            return "No active memory available.".to_string();
+            return Ok("No active memory available.".to_string());
         }
 
         let count = self.entries.len().min(self.max_synthesize);
@@ -183,7 +204,7 @@ impl ActiveMemory {
             self.entries.len()
         ));
 
-        parts.join("\n")
+        Ok(parts.join("\n"))
     }
 
     /// 返回当前条目数
@@ -219,8 +240,8 @@ mod tests {
 
     #[test]
     fn test_empty_memory_synthesize() {
-        let mem = ActiveMemory::new();
-        let result = mem.synthesize();
+        let mut mem = ActiveMemory::new();
+        let result = mem.synthesize().unwrap();
         assert_eq!(result, "No active memory available.");
     }
 
@@ -237,7 +258,7 @@ mod tests {
             vec!["greeting"],
         ));
 
-        let result = mem.synthesize();
+        let result = mem.synthesize().unwrap();
         assert!(result.contains("Hello world"));
         assert!(result.contains("from test"));
         assert!(result.contains("[greeting]"));
@@ -261,7 +282,7 @@ mod tests {
             ));
         }
 
-        let result = mem.synthesize();
+        let result = mem.synthesize().unwrap();
         // 应该只包含 2 条
         assert!(result.contains("2 recent entries"));
         assert!(result.contains("Entry 0"));
@@ -298,7 +319,7 @@ mod tests {
             vec![],
         ));
 
-        let result = mem.synthesize();
+        let result = mem.synthesize().unwrap();
         // 最新的在前
         let new_pos = result.find("Newest").unwrap();
         let mid_pos = result.find("Middle").unwrap();
@@ -331,7 +352,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(loaded.len(), 1);
 
-        let result = loaded.synthesize();
+        let result = loaded.synthesize().unwrap();
         assert!(result.contains("Persisted memory"));
     }
 
@@ -349,7 +370,7 @@ mod tests {
         assert_eq!(mem.len(), 0);
         assert!(mem.is_empty());
 
-        let result = mem.synthesize();
+        let result = mem.synthesize().unwrap();
         assert_eq!(result, "No active memory available.");
     }
 }
