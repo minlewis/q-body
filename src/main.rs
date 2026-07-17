@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 
 mod a2a;
 mod handler;
+mod risk;
 mod state;
 
 use a2a::types::*;
