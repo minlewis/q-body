@@ -13,6 +13,7 @@
 //!     GetTask      — 查询 Task 状态与历史
 //!     ListTasks    — 列出所有 Task
 
+use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -170,6 +171,37 @@ async fn main() {
     tracing::info!("   JSON-RPC:   http://{addr}/a2a/jsonrpc");
     tracing::info!("{sep}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Failed to bind to {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app).await {
+        // 检查是否是 IO 错误（broken-pipe / connection-reset / connection-aborted）
+        // 这类错误在客户端断开连接时常见，不应 panic 退出
+        if let Some(io_err) = e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => {
+                    tracing::warn!(
+                        "Server connection closed (IO error: {}), shutting down gracefully",
+                        io_err
+                    );
+                    std::process::exit(0);
+                }
+                _ => {
+                    tracing::error!("Unexpected IO error during serve: {io_err}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // 非 IO 错误（如 hyper 内部错误）— 仍应 panic 报告
+            tracing::error!("Server error during serve: {e}");
+            std::process::exit(1);
+        }
+    }
 }
