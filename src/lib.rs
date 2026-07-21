@@ -4,4 +4,5 @@
 
 pub mod a2a;
 pub mod handler;
+pub mod memory;
 pub mod state;
