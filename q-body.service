@@ -1,0 +1,17 @@
+[Unit]
+Description=q-body A2A Agent (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/q-body
+# LLM 凭证：生产环境建议改用 EnvironmentFile=/etc/q-body/env
+Environment=ARK_API_KEY=your-key-here
+ExecStart=/home/ubuntu/q-body/target/release/q-body --port 41242
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -89,4 +89,12 @@ impl TaskStore {
         let store = self.tasks.read().await;
         store.get(task_id).cloned()
     }
+
+    /// 列出所有 Task（按 id 排序，保证输出稳定）
+    pub async fn list_tasks(&self) -> Vec<Task> {
+        let store = self.tasks.read().await;
+        let mut tasks: Vec<Task> = store.values().cloned().collect();
+        tasks.sort_by(|a, b| a.id.cmp(&b.id));
+        tasks
+    }
 }

@@ -163,6 +163,13 @@ Phase 5 — SSE Streaming
 
 ## 2026-06-01 — 接入 M3 Provider（Anthropic Messages 多模态）
 
+> **⚠️ 勘误（2026-07-21）：本篇记录的代码从未合入 main。**
+> main 分支上不存在 `config.rs`、`InferWithM3` 方法、`M3Config`——`handler.rs`
+> 仍是硬编码的 `LLM_API_URL`/`LLM_MODEL`。当时验证通过的改动丢失了（疑似只留在
+> 本地或某个未推送的分支）。这正是本篇自己引用的信念的反面教材：
+> *"Code unlanded is code unwritten"*。以下为历史记录，仅供重做时参考。
+> **教训沉淀：学习笔记声称的实现必须附带已合并的 commit 链接，否则视为未消化。**
+
 ### 背景
 MiniMax 发布 M3，定位"原生多模态 + 1M 上下文 + Frontier Coding + Agent"。
 q-body 当前默认 LLM 是 deepseek-v4-flash（走 OpenAI Chat Completions，无视觉能力）。

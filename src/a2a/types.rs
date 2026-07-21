@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+// A2A 线协议（wire protocol）使用小写枚举值（如 "submitted"/"user"），
+// Rust 命名风格与协议兼容性冲突时，以协议为准（见下方 enum 上的 allow）。
+
 // ============================================================
 // Agent Card — agent 对外暴露的元信息
 // ============================================================
@@ -68,6 +71,7 @@ pub struct AgentInterface {
 
 /// 消息中的角色
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(non_camel_case_types)]
 pub enum Role {
     user,
     assistant,
@@ -110,6 +114,7 @@ pub struct Message {
 // ============================================================
 
 /// 任务状态
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskState {
     submitted,
@@ -291,5 +296,122 @@ impl JsonRpcError {
                 message: format!("Internal error: {msg}"),
             },
         }
+    }
+}
+// ============================================================
+// Tests — JSON-RPC 序列化契约
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// camelCase 重命名契约：contextId / messageId / mediaType / lastChunk
+    #[test]
+    fn task_serializes_camel_case_fields() {
+        let task = Task {
+            id: "t-1".into(),
+            context_id: Some("ctx-1".into()),
+            status: TaskStatus {
+                state: TaskState::submitted,
+                message: None,
+            },
+            history: None,
+            artifacts: None,
+        };
+        let v = serde_json::to_value(&task).unwrap();
+        assert_eq!(v["contextId"], "ctx-1");
+        assert!(v.get("context_id").is_none());
+        // Option::is_none 字段必须被跳过
+        assert!(v.get("history").is_none());
+        assert!(v.get("artifacts").is_none());
+    }
+
+    #[test]
+    fn message_serializes_message_id_camel_case() {
+        let msg = Message {
+            role: "user".into(),
+            parts: vec![Part::text("hi")],
+            message_id: Some("m-1".into()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["messageId"], "m-1");
+        assert!(v.get("message_id").is_none());
+    }
+
+    /// JSON-RPC 成功响应的形状契约
+    #[test]
+    fn jsonrpc_success_response_shape() {
+        let resp = JsonRpcResponse::success(json!(1), json!({"ok": true}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["ok"], true);
+        assert!(v.get("error").is_none());
+    }
+
+    /// JSON-RPC 错误码契约：-32601 method not found / -32602 invalid params / -32603 internal
+    #[test]
+    fn jsonrpc_error_codes_match_spec() {
+        let e = JsonRpcError::method_not_found(json!("req-1"), "tasks/send");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tasks/send")
+        );
+
+        let e2 = JsonRpcError::invalid_params(json!(2), "bad");
+        assert_eq!(
+            serde_json::to_value(&e2).unwrap()["error"]["code"],
+            json!(-32602)
+        );
+
+        let e3 = JsonRpcError::internal(json!(3), "boom");
+        assert_eq!(
+            serde_json::to_value(&e3).unwrap()["error"]["code"],
+            json!(-32603)
+        );
+    }
+
+    /// TaskState 未知状态反序列化为 Unknown（前向兼容）
+    #[test]
+    fn task_state_unknown_variant_roundtrip() {
+        let s: TaskState = serde_json::from_value(json!("input-required")).unwrap();
+        assert_eq!(s, TaskState::Unknown("input-required".into()));
+        let c: TaskState = serde_json::from_value(json!("completed")).unwrap();
+        assert_eq!(c, TaskState::completed);
+    }
+
+    /// SendMessageResponse::from_task 取 history 最后一条作为 message
+    #[test]
+    fn send_message_response_from_task_picks_last_history() {
+        let task = Task {
+            id: "t-9".into(),
+            context_id: None,
+            status: TaskStatus {
+                state: TaskState::completed,
+                message: None,
+            },
+            history: Some(vec![
+                Message {
+                    role: "user".into(),
+                    parts: vec![Part::text("q")],
+                    message_id: None,
+                },
+                Message {
+                    role: "assistant".into(),
+                    parts: vec![Part::text("a")],
+                    message_id: None,
+                },
+            ]),
+            artifacts: None,
+        };
+        let resp = SendMessageResponse::from_task(&task);
+        assert_eq!(resp.id, "t-9");
+        assert_eq!(resp.message.unwrap().role, "assistant");
     }
 }
