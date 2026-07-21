@@ -18,22 +18,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State,
     http::{HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
-mod a2a;
-mod handler;
-mod state;
-
-use a2a::types::*;
-use handler::QBodyHandler;
-use state::TaskStore;
+use q_body::a2a::types::*;
+use q_body::handler::QBodyHandler;
+use q_body::state::TaskStore;
 
 /// 共享应用状态
 struct AppState {
@@ -61,11 +57,10 @@ async fn jsonrpc_handler(
     if req.jsonrpc != "2.0" {
         return (
             StatusCode::OK,
-            Json(serde_json::to_value(JsonRpcError::invalid_params(
-                req.id,
-                "jsonrpc must be 2.0",
-            ))
-            .unwrap()),
+            Json(
+                serde_json::to_value(JsonRpcError::invalid_params(req.id, "jsonrpc must be 2.0"))
+                    .unwrap(),
+            ),
         );
     }
 
@@ -89,21 +84,27 @@ async fn main() {
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
     // 解析命令行参数
     let mut port: u16 = 41242;
-    for arg in std::env::args().skip(1) {
-        if let Some(p) = arg.strip_prefix("--port=") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(p) = args[i].strip_prefix("--port=") {
             if let Ok(n) = p.parse() {
                 port = n;
             }
-        } else if arg == "--port" {
-            // handled by next arg, but we don't parse pairs here — too simple
+        } else if args[i] == "--port" {
+            // 支持 "--port 41242" 成对形式
+            if let Some(n) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                port = n;
+                i += 1;
+            }
         }
+        i += 1;
     }
 
     // 构建 Agent Card
@@ -115,7 +116,7 @@ async fn main() {
             organization: "Q宝宝实验室".into(),
             url: "https://github.com/q-baby".into(),
         }),
-        version: "0.1.0".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
         capabilities: Some(AgentCapabilities {
             streaming: false,
             push_notifications: false,
@@ -127,11 +128,7 @@ async fn main() {
             name: "q-body Core".into(),
             description: "核心 A2A 通信能力，用于验证 agent 间协作链路".into(),
             tags: vec!["a2a".into(), "core".into(), "evolution".into()],
-            examples: vec![
-                "hello".into(),
-                "what can you do".into(),
-                "你的能力".into(),
-            ],
+            examples: vec!["hello".into(), "what can you do".into(), "你的能力".into()],
             input_modes: vec!["text".into()],
             output_modes: vec!["text".into()],
         }],
@@ -164,7 +161,7 @@ async fn main() {
         port,
     );
 
-    let sep: String = std::iter::repeat('=').take(50).collect();
+    let sep: String = "=".repeat(50);
     tracing::info!("{sep}");
     tracing::info!("🚀 q-body A2A Server (Rust) starting...");
     tracing::info!("   Agent Card: http://{addr}/.well-known/agent-card.json");

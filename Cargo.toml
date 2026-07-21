@@ -4,6 +4,9 @@ version = "0.1.3"
 edition = "2024"
 description = "Q宝宝的自进化身体 — Rust A2A Agent"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 # Web 框架
 axum = "0.8"

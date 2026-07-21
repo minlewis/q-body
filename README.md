@@ -63,6 +63,9 @@ cargo build --release
 
 # Or install as a systemd service
 sudo cp q-body.service /etc/systemd/system/
+# 编辑单元文件填入真实 ARK_API_KEY（或改用 EnvironmentFile）
+sudoedit /etc/systemd/system/q-body.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now q-body
 ```
 
@@ -96,10 +99,11 @@ Implements the [A2A Protocol](https://github.com/a2aproject/A2A) core methods:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `message/send` | `POST /a2a/jsonrpc` | Send message, get response |
-| `tasks/send` | `POST /a2a/jsonrpc` | Create a task |
 | `tasks/get` | `POST /a2a/jsonrpc` | Get task status |
 | `tasks/list` | `POST /a2a/jsonrpc` | List active tasks |
 | Agent Card | `GET /.well-known/agent-card.json` | Agent discovery |
+
+Both PascalCase (`SendMessage`, `GetTask`, `ListTasks`) and slash-style method names are accepted.
 
 ## soul/
 

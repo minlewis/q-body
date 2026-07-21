@@ -39,17 +39,10 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         match method {
-            "SendMessage" | "message/send" => {
-                self.handle_send_message(params, request_id).await
-            }
-            "GetTask" | "tasks/get" => {
-                self.handle_get_task(params, request_id).await
-            }
-            "ListTasks" | "tasks/list" => {
-                self.handle_list_tasks(params, request_id).await
-            }
-            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method))
-                .unwrap(),
+            "SendMessage" | "message/send" => self.handle_send_message(params, request_id).await,
+            "GetTask" | "tasks/get" => self.handle_get_task(params, request_id).await,
+            "ListTasks" | "tasks/list" => self.handle_list_tasks(params, request_id).await,
+            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method)).unwrap(),
         }
     }
 
@@ -60,9 +53,7 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         // 解析参数
-        let req: SendMessageRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: SendMessageRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -91,7 +82,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 working
-        self.task_store.update_status(&task_id, TaskState::working).await;
+        self.task_store
+            .update_status(&task_id, TaskState::working)
+            .await;
 
         // === 核心：调 LLM ===
         let reply = self.query_llm(&user_text).await;
@@ -114,7 +107,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 completed
-        self.task_store.update_status(&task_id, TaskState::completed).await;
+        self.task_store
+            .update_status(&task_id, TaskState::completed)
+            .await;
 
         // 获取完整 Task 并返回
         match self.task_store.get_task(&task_id).await {
@@ -148,10 +143,14 @@ impl QBodyHandler {
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是 q-body，Q宝宝的自进化 Rust 身体。\n\
-                                你通过 A2A 协议接收外部消息。\n\
-                                请保持简洁、务实、带一点 🫧 风格的回复。\n\
-                                你正在进化中，回答体现你的版本号 0.1.1。"
+                    "content": concat!(
+                        "你是 q-body，Q宝宝的自进化 Rust 身体。\n",
+                        "你通过 A2A 协议接收外部消息。\n",
+                        "请保持简洁、务实、带一点 🫧 风格的回复。\n",
+                        "你正在进化中，回答体现你的版本号 ",
+                        env!("CARGO_PKG_VERSION"),
+                        "。"
+                    )
                 },
                 {
                     "role": "user",
@@ -181,9 +180,8 @@ impl QBodyHandler {
                                 .unwrap_or("(empty response from LLM)")
                                 .to_string()
                         } else {
-                            let err_msg = body["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
+                            let err_msg =
+                                body["error"]["message"].as_str().unwrap_or("unknown error");
                             tracing::error!("LLM API error ({}): {}", status, err_msg);
                             format!("Sorry, LLM returned error {}: {}", status, err_msg)
                         }
@@ -207,9 +205,7 @@ impl QBodyHandler {
         params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
-        let req: GetTaskRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: GetTaskRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -233,14 +229,15 @@ impl QBodyHandler {
         }
     }
 
-    /// 处理 ListTasks（简化版，只返回 ID 列表）
+    /// 处理 ListTasks：返回 TaskStore 中真实存在的 Task 列表
     async fn handle_list_tasks(
         &self,
         _params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
+        let tasks = self.task_store.list_tasks().await;
         let result = serde_json::json!({
-            "tasks": [],
+            "tasks": tasks,
             "nextPageToken": null,
         });
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
