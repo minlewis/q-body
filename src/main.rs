@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 mod a2a;
 mod handler;
 mod state;
+mod validator;
 
 use a2a::types::*;
 use handler::QBodyHandler;
