@@ -269,4 +269,49 @@ mod tests {
         assert!(msg.contains("Q_BODY_NONEXISTENT_XYZ"));
         assert!(msg.contains(":?"));
     }
+
+    // ── 边界用例：trailing whitespace / 空参 / 多余空格 ──
+    // 借鉴 yoyo-evolve DREAM 实验发现的 route_command 边界 bug，
+    // 直接免疫同类问题。
+
+    #[test]
+    fn test_edge_trailing_whitespace() {
+        // 末尾带空格 / 换行 / tab 不影响判定
+        assert!(has_rm_rf("rm -rf /tmp/foo "));
+        assert!(has_rm_rf("rm -rf /tmp/foo\n"));
+        assert!(has_rm_rf("rm -rf /tmp/foo\t"));
+        assert!(has_rm_rf("  rm -rf /tmp/foo  "));
+
+        // 末尾空白不干扰 scan_rm_command
+        assert!(scan_rm_command("rm -rf /tmp/foo ").is_ok());
+        assert!(scan_rm_command("rm -rf / ").is_err());
+        assert!(scan_rm_command("rm -rf $Q_BODY_NONEXISTENT_EDGE_WS /tmp ").is_err());
+    }
+
+    #[test]
+    fn test_edge_empty_args() {
+        // 空字符串参数不 panic、不误判
+        assert!(!has_rm_rf(""));
+        assert!(!has_rm_rf("   "));
+        assert!(scan_rm_command("").is_ok());
+        assert!(scan_rm_command("   ").is_ok());
+
+        // 空参数嵌在中间
+        assert!(has_rm_rf("rm  -rf  /tmp/foo"));
+        assert!(scan_rm_command("rm  -rf  /tmp/foo").is_ok());
+    }
+
+    #[test]
+    fn test_edge_extra_spaces() {
+        // 多余空格不破坏变量提取
+        let vars = extract_variables("rm  -rf  $HOME /tmp");
+        assert_eq!(vars, vec!["HOME"]);
+
+        let vars = extract_variables("rm   -rf   ${HOME}  /tmp");
+        assert_eq!(vars, vec!["HOME"]);
+
+        // 多余空格不破坏危险目标识别
+        assert!(scan_rm_command("rm  -rf  / ").is_err());
+        assert!(scan_rm_command("rm   -rf   /tmp/foo").is_ok());
+    }
 }
