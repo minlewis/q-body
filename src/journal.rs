@@ -379,6 +379,66 @@ impl Journal {
     pub fn total_assessments(&self) -> usize {
         self.assessments.len()
     }
+
+    /// 把 `since` 以来的 journal 事件压缩为固定 schema 的 `ActiveContext`。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — `synthesize: regenerate active memory context`
+    /// （commit 854d7b75）。yoyo 在每个任务入口前把全量 memory 重新合成为
+    /// active context 文件，LLM prompt 注入压缩产物而非全量历史——调用方不感知
+    /// 底层存储，只拿合成结果。
+    ///
+    /// 启发式归类：
+    /// - suggestion 含「目标/计划/要做」→ `today_goals`
+    /// - suggestion 含「？/待/未决/疑问」→ `open_questions`
+    /// - action + verification 均已闭环的事件 → `key_decisions`
+    ///
+    /// 一条 suggestion 可同时命中目标与未决（如实归类，不做互斥裁决）。
+    pub fn synthesize(&self, since: DateTime<Utc>) -> ActiveContext {
+        let mut ctx = ActiveContext::default();
+        for event in self.events.iter().filter(|e| e.timestamp >= since) {
+            let text = event.suggestion.as_str();
+            if GOAL_KEYWORDS.iter().any(|k| text.contains(k)) {
+                ctx.today_goals.push(event.suggestion.clone());
+            }
+            if QUESTION_KEYWORDS.iter().any(|k| text.contains(k)) {
+                ctx.open_questions.push(event.suggestion.clone());
+            }
+            if event.reached(EvolutionStage::Action) && event.reached(EvolutionStage::Verification) {
+                ctx.key_decisions.push(format!(
+                    "{} -> {}",
+                    event.action.as_deref().unwrap_or(""),
+                    event.verification.as_deref().unwrap_or("")
+                ));
+            }
+        }
+        ctx
+    }
+}
+
+/// 今日目标归类关键词
+const GOAL_KEYWORDS: &[&str] = &["目标", "计划", "要做"];
+/// 未决问题归类关键词
+const QUESTION_KEYWORDS: &[&str] = &["？", "?", "待", "未决", "疑问"];
+
+/// ActiveContext — 近 24h journal 的压缩产物，固定 schema。
+///
+/// LLM system prompt 注入这份 TOML 而非全量 journal，控制上下文体积。
+/// 三个字段均为数组，空 journal 合成结果为三段空数组的合法 TOML。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActiveContext {
+    /// 今日目标（来自含目标关键词的 suggestion）
+    pub today_goals: Vec<String>,
+    /// 未决问题（来自含疑问关键词的 suggestion）
+    pub open_questions: Vec<String>,
+    /// 关键决策（action + verification 均已闭环的事件）
+    pub key_decisions: Vec<String>,
+}
+
+impl ActiveContext {
+    /// 序列化为 `active_context.toml` 文本格式。
+    pub fn to_toml(&self) -> String {
+        toml::to_string(self).unwrap_or_else(|_| String::new())
+    }
 }
 
 #[cfg(test)]
@@ -705,5 +765,59 @@ mod tests {
         // reset_cycle 不清空 append-only 的评估记录（与 events / predictions 一致）
         journal.reset_cycle();
         assert_eq!(journal.total_assessments(), 2);
+    }
+
+    #[test]
+    fn test_synthesize_classifies_and_filters() {
+        let mut journal = Journal::new();
+        // 今日目标（含「计划」）
+        journal.record(
+            EvolutionSignal::Refactor,
+            "src".into(),
+            "计划拆分 handler 模块".into(),
+        );
+        // 未决问题（含「？」）
+        journal.record(
+            EvolutionSignal::Test,
+            "src".into(),
+            "是否补集成测试？".into(),
+        );
+        // 关键决策：action + verification 双闭环
+        journal.record_loop(
+            EvolutionSignal::Bump,
+            "src".into(),
+            "升级依赖".into(),
+            "bump serde 1.0.200".into(),
+            "cargo test passed".into(),
+        );
+
+        let ctx = journal.synthesize(Utc::now() - chrono::Duration::hours(24));
+        assert_eq!(ctx.today_goals, vec!["计划拆分 handler 模块"]);
+        assert_eq!(ctx.open_questions, vec!["是否补集成测试？"]);
+        assert_eq!(
+            ctx.key_decisions,
+            vec!["bump serde 1.0.200 -> cargo test passed"]
+        );
+
+        // 窗口外事件不进入合成结果（所有事件刚落盘，用未来时间戳过滤应为全空）
+        let future = journal.synthesize(Utc::now() + chrono::Duration::hours(1));
+        assert_eq!(future, ActiveContext::default());
+    }
+
+    #[test]
+    fn test_synthesize_toml_roundtrip() {
+        // 空 journal → 三段空数组的合法 TOML，可解析回同样结构
+        let empty = ActiveContext::default().to_toml();
+        let parsed: ActiveContext = toml::from_str(&empty).expect("valid toml");
+        assert_eq!(parsed, ActiveContext::default());
+
+        // 非空 roundtrip
+        let ctx = ActiveContext {
+            today_goals: vec!["目标A".into()],
+            open_questions: vec!["问题B？".into()],
+            key_decisions: vec!["改了X -> 测试通过".into()],
+        };
+        let parsed: ActiveContext = toml::from_str(&ctx.to_toml()).expect("valid toml");
+        assert_eq!(parsed, ctx);
     }
 }
