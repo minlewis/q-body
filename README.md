@@ -13,6 +13,16 @@ Hermes (Chat Gateway) ───────────────────�
                                               (deepseek-v4-flash)
 ```
 
+## Project Constitution
+
+q-body follows a Taoist engineering philosophy: **为学日益，为道日损** (Learning accumulates; the Way subtracts).
+
+- **Learning has no ceiling** — LEARNINGS.md only grows. Study every major agent framework, absorb every pattern.
+- **Code has a hard ceiling** — ≤3000 lines of Rust, ≤15 dependencies. Every PR must answer: *what did this subtract?*
+- **Soul over body** — If a feature can live in SOUL.md (prompt/memory), it doesn't belong in src/.
+
+Read the full constitution: [soul/TAO.md](soul/TAO.md)
+
 ## Architecture
 
 ```
@@ -25,6 +35,7 @@ q-body/
 │       ├── mod.rs       # A2A protocol service layer
 │       └── types.rs     # AgentCard, Task, Message, Part types
 ├── soul/
+│   ├── TAO.md           # Project constitution (this file)
 │   └── SOUL.md          # Portable identity file (Chinese)
 ├── Cargo.toml
 └── README.md
