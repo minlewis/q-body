@@ -35,7 +35,7 @@ q-body/
 │       ├── mod.rs       # A2A protocol service layer
 │       └── types.rs     # AgentCard, Task, Message, Part types
 ├── soul/
-│   ├── TAO.md           # Project constitution (this file)
+│   ├── TAO.md           # Project constitution — the unchanging Way
 │   └── SOUL.md          # Portable identity file (Chinese)
 ├── Cargo.toml
 └── README.md
