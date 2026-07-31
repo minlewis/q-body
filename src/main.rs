@@ -6,6 +6,7 @@
 //!
 //! 端点：
 //!     GET  /.well-known/agent-card.json   — Agent Card 发现
+//!     GET  /skills                        — 列出所有已注册 skill
 //!     POST /a2a/jsonrpc                   — JSON-RPC 端点
 //!
 //! A2A 方法支持：
@@ -29,16 +30,19 @@ use tracing_subscriber::EnvFilter;
 
 mod a2a;
 mod handler;
+mod skills;
 mod state;
 mod validator;
 
-use a2a::types::*;
+use crate::a2a::types::*;
+use crate::skills::{SkillManifest, SkillsRegistry};
 use handler::QBodyHandler;
 use state::TaskStore;
 
 /// 共享应用状态
 struct AppState {
     handler: QBodyHandler,
+    skills: SkillsRegistry,
 }
 
 // ============================================================
@@ -48,6 +52,19 @@ struct AppState {
 async fn get_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let card = state.handler.agent_card.clone();
     Json(card)
+}
+
+// ============================================================
+// Skills 端点（只读，GET /skills）
+// ============================================================
+
+/// GET /skills — 列出所有已注册 skill
+async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let skills: Vec<&SkillManifest> = state.skills.list();
+    Json(serde_json::json!({
+        "skills": skills,
+        "count": skills.len(),
+    }))
 }
 
 // ============================================================
@@ -146,7 +163,20 @@ async fn main() {
     let task_store = TaskStore::new();
     let handler = QBodyHandler::new(task_store, agent_card);
 
-    let state = Arc::new(AppState { handler });
+    let mut skills_registry = SkillsRegistry::new();
+    // 注册内建 skill：q-body core
+    skills_registry.register(SkillManifest {
+        name: "q-body-core".into(),
+        version: "0.1.0".into(),
+        description: "核心 A2A 通信能力，用于验证 agent 间协作链路".into(),
+        schema: None,
+        entrypoint: "builtin://a2a/jsonrpc".into(),
+    });
+
+    let state = Arc::new(AppState {
+        handler,
+        skills: skills_registry,
+    });
 
     // CORS —— 允许跨域调用
     let cors = CorsLayer::new()
@@ -157,6 +187,7 @@ async fn main() {
     let app = Router::new()
         .route("/.well-known/agent-card.json", get(get_agent_card))
         .route("/a2a/jsonrpc", post(jsonrpc_handler))
+        .route("/skills", get(list_skills))
         .layer(cors)
         .with_state(state);
 
@@ -170,6 +201,7 @@ async fn main() {
     tracing::info!("🚀 q-body A2A Server (Rust) starting...");
     tracing::info!("   Agent Card: http://{addr}/.well-known/agent-card.json");
     tracing::info!("   JSON-RPC:   http://{addr}/a2a/jsonrpc");
+    tracing::info!("   Skills:     http://{addr}/skills");
     tracing::info!("{sep}");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
