@@ -5,9 +5,11 @@
 //! - GetTask：查询 Task 状态
 //! - ListTasks: 列出所有 Task
 
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::a2a::types::*;
+use crate::retry::RetryCounter;
 use crate::state::TaskStore;
 
 /// 火山引擎 deepseek-v4-flash 的 API 端点
@@ -20,6 +22,8 @@ pub struct QBodyHandler {
     pub agent_card: AgentCard,
     /// HTTP 客户端（复用连接，避免每次新建）
     http_client: reqwest::Client,
+    /// 重试计数器 — 追踪 LLM 调用重试频率
+    pub retry_counter: Mutex<RetryCounter>,
 }
 
 impl QBodyHandler {
@@ -28,6 +32,7 @@ impl QBodyHandler {
             task_store,
             agent_card,
             http_client: reqwest::Client::new(),
+            retry_counter: Mutex::new(RetryCounter::new()),
         }
     }
 
@@ -130,7 +135,7 @@ impl QBodyHandler {
         }
     }
 
-    /// 调 deepseek-v4-flash（火山引擎）
+    /// 调 deepseek-v4-flash（火山引擎），失败时自动重试最多 2 次
     async fn query_llm(&self, user_text: &str) -> String {
         let api_key = match std::env::var("ARK_API_KEY") {
             Ok(k) => k,
@@ -161,44 +166,79 @@ impl QBodyHandler {
             "stream": false
         });
 
-        let response = self
-            .http_client
-            .post(LLM_API_URL)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&request_body)
-            .send()
-            .await;
+        // 最多重试 2 次（首次 + 2 次 retry = 3 次尝试）
+        let max_retries = 2;
 
-        match response {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        if status.is_success() {
-                            // 从 OpenAI 格式的响应中提取文本
-                            body["choices"][0]["message"]["content"]
-                                .as_str()
-                                .unwrap_or("(empty response from LLM)")
-                                .to_string()
-                        } else {
-                            let err_msg = body["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
-                            tracing::error!("LLM API error ({}): {}", status, err_msg);
-                            format!("Sorry, LLM returned error {}: {}", status, err_msg)
+        for attempt in 0..=max_retries {
+            let response = self
+                .http_client
+                .post(LLM_API_URL)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&request_body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                // 成功 — 返回结果
+                                return body["choices"][0]["message"]["content"]
+                                    .as_str()
+                                    .unwrap_or("(empty response from LLM)")
+                                    .to_string();
+                            } else {
+                                let err_msg = body["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error");
+                                if attempt < max_retries {
+                                    tracing::warn!(
+                                        "LLM API error ({}): {} — retrying ({}/{})",
+                                        status, err_msg, attempt + 1, max_retries
+                                    );
+                                    let _ = self.retry_counter.lock().map(|mut c| c.bump("llm_api_error"));
+                                    continue;
+                                } else {
+                                    tracing::error!("LLM API error ({}): {} — exhausted retries", status, err_msg);
+                                    return format!("Sorry, LLM returned error {}: {}", status, err_msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if attempt < max_retries {
+                                tracing::warn!(
+                                    "Failed to parse LLM response: {} — retrying ({}/{})",
+                                    e, attempt + 1, max_retries
+                                );
+                                let _ = self.retry_counter.lock().map(|mut c| c.bump("llm_parse_error"));
+                                continue;
+                            } else {
+                                tracing::error!("Failed to parse LLM response: {} — exhausted retries", e);
+                                return format!("Sorry, failed to parse LLM response: {}", e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to parse LLM response: {}", e);
-                        format!("Sorry, failed to parse LLM response: {}", e)
+                }
+                Err(e) => {
+                    if attempt < max_retries {
+                        tracing::warn!(
+                            "HTTP request to LLM failed: {} — retrying ({}/{})",
+                            e, attempt + 1, max_retries
+                        );
+                        let _ = self.retry_counter.lock().map(|mut c| c.bump("llm_http_error"));
+                        continue;
+                    } else {
+                        tracing::error!("HTTP request to LLM failed: {} — exhausted retries", e);
+                        return format!("Sorry, LLM request failed: {}", e);
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("HTTP request to LLM failed: {}", e);
-                format!("Sorry, LLM request failed: {}", e)
-            }
         }
+
+        // 理论上不会走到这里（retry loop 一定有 return），但兜底
+        "Sorry, LLM request failed after all retries".to_string()
     }
 
     /// 处理 GetTask：查询指定 Task 的状态和结果
