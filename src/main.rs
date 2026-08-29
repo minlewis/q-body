@@ -29,6 +29,8 @@ use tracing_subscriber::EnvFilter;
 
 mod a2a;
 mod handler;
+mod local_search;
+mod mcp_registry;
 mod state;
 mod validator;
 

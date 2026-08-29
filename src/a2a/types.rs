@@ -4,6 +4,8 @@
 //! - AgentCard: agent 发现用的"名片"
 //! - Task: 任务生命周期
 //! - Message / Part: 消息与内容片
+//! - MCP (Model Context Protocol): 参考 modelcontextprotocol/specification
+//!   — McpCapability / McpServerCapabilities 用于协议注册/发现
 
 use serde::{Deserialize, Serialize};
 
@@ -290,6 +292,53 @@ impl JsonRpcError {
                 code: -32603,
                 message: format!("Internal error: {msg}"),
             },
+        }
+    }
+}
+
+// ============================================================
+// MCP (Model Context Protocol) 类型 — 参考 modelcontextprotocol/specification
+// ============================================================
+
+/// MCP 能力类型：Tool（工具调用）/ Resource（资源发现）/ Prompt（提示模板）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum McpCapability {
+    Tool,
+    Resource,
+    Prompt,
+}
+
+/// MCP Server 能力声明
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerCapabilities {
+    pub capabilities: Vec<McpCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+}
+
+impl Default for McpServerCapabilities {
+    fn default() -> Self {
+        Self {
+            capabilities: Vec::new(),
+            protocol_version: Some("2025-03-26".into()),
+        }
+    }
+}
+
+impl McpServerCapabilities {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 检查是否支持指定能力
+    pub fn supports(&self, capability: &McpCapability) -> bool {
+        self.capabilities.contains(capability)
+    }
+
+    /// 注册一项能力
+    pub fn register(&mut self, capability: McpCapability) {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
         }
     }
 }
