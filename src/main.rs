@@ -82,6 +82,18 @@ async fn jsonrpc_handler(
 }
 
 // ============================================================
+// Health Check 端点
+// ============================================================
+
+async fn health_check() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "q-body",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+// ============================================================
 // 启动
 // ============================================================
 
@@ -157,6 +169,7 @@ async fn main() {
     let app = Router::new()
         .route("/.well-known/agent-card.json", get(get_agent_card))
         .route("/a2a/jsonrpc", post(jsonrpc_handler))
+        .route("/health", get(health_check))
         .layer(cors)
         .with_state(state);
 

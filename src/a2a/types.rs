@@ -293,3 +293,56 @@ impl JsonRpcError {
         }
     }
 }
+
+// ============================================================
+// Smoke tests — A2A schema + JSON-RPC contract
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AgentCard must serialize camelCase fields per A2A spec
+    #[test]
+    fn agent_card_schema_camel_case() {
+        let card = AgentCard {
+            name: "q-body".into(),
+            description: "test agent".into(),
+            url: Some("http://localhost:41242".into()),
+            provider: None,
+            version: "0.1.0".into(),
+            capabilities: None,
+            default_input_modes: vec!["text".into()],
+            default_output_modes: vec!["text".into()],
+            skills: vec![],
+            supported_interfaces: vec![],
+        };
+        let json = serde_json::to_value(&card).unwrap();
+        assert!(json.get("defaultInputModes").is_some(), "missing defaultInputModes");
+        assert!(json.get("defaultOutputModes").is_some(), "missing defaultOutputModes");
+        assert!(json.get("supportedInterfaces").is_some(), "missing supportedInterfaces");
+        assert!(json.get("default_input_modes").is_none(), "snake_case leaked");
+        // round-trip
+        let card2: AgentCard = serde_json::from_value(json).unwrap();
+        assert_eq!(card2.name, "q-body");
+    }
+
+    /// JSON-RPC error codes must match spec (-32601 / -32602 / -32603)
+    #[test]
+    fn jsonrpc_error_codes_match_spec() {
+        let id = serde_json::json!(42);
+        assert_eq!(JsonRpcError::method_not_found(id.clone(), "x").error.code, -32601);
+        assert_eq!(JsonRpcError::invalid_params(id.clone(), "y").error.code, -32602);
+        assert_eq!(JsonRpcError::internal(id, "z").error.code, -32603);
+    }
+
+    /// JSON-RPC success response must have {jsonrpc, id, result}
+    #[test]
+    fn jsonrpc_response_success_format() {
+        let resp = JsonRpcResponse::success(serde_json::json!(1), "ok");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["result"], "ok");
+    }
+}
