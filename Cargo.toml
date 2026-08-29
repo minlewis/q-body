@@ -32,3 +32,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # base64 编码（M3 image content blocks）
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
