@@ -63,6 +63,42 @@ pub struct AgentInterface {
 }
 
 // ============================================================
+// Transport — 传输协议枚举
+// ============================================================
+
+/// A2A 传输协议
+///
+/// 借鉴：tomtom215/a2a-rust — 四传输层设计（JSON-RPC/REST/WebSocket/gRPC），
+/// q-body 当前仅实现 JSON-RPC over HTTP；WebSocket 为计划中的传输扩展，
+/// 用于支持长连接双向通信和流式 LLM 响应推送。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Transport {
+    /// JSON-RPC over HTTP（当前唯一支持的传输）
+    Jsonrpc,
+    /// WebSocket 传输（计划中 — 支持 streaming 响应和实时状态推送）
+    Ws,
+}
+
+impl Transport {
+    /// 返回 `AgentInterface.protocol_binding` 字段使用的规范字符串
+    pub fn as_binding(&self) -> &'static str {
+        match self {
+            Transport::Jsonrpc => "JSONRPC",
+            Transport::Ws => "WS",
+        }
+    }
+}
+
+impl AgentInterface {
+    /// 判断此接口是否使用 WebSocket 传输
+    pub fn is_websocket(&self) -> bool {
+        self.protocol_binding.eq_ignore_ascii_case("WS")
+            || self.protocol_binding.eq_ignore_ascii_case("WEBSOCKET")
+    }
+}
+
+// ============================================================
 // Message — agent 之间交换的消息
 // ============================================================
 
@@ -291,5 +327,41 @@ impl JsonRpcError {
                 message: format!("Internal error: {msg}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transport_binding_strings() {
+        assert_eq!(Transport::Jsonrpc.as_binding(), "JSONRPC");
+        assert_eq!(Transport::Ws.as_binding(), "WS");
+    }
+
+    #[test]
+    fn test_agent_interface_is_websocket() {
+        let ws_iface = AgentInterface {
+            protocol_binding: "WS".into(),
+            protocol_version: "1.0".into(),
+            url: "ws://127.0.0.1:41242/a2a/ws".into(),
+        };
+        assert!(ws_iface.is_websocket());
+
+        let http_iface = AgentInterface {
+            protocol_binding: "JSONRPC".into(),
+            protocol_version: "1.0".into(),
+            url: "http://127.0.0.1:41242/a2a/jsonrpc".into(),
+        };
+        assert!(!http_iface.is_websocket());
+    }
+
+    #[test]
+    fn test_transport_serde_roundtrip() {
+        let json = serde_json::to_string(&Transport::Ws).unwrap();
+        assert_eq!(json, "\"WS\"");
+        let back: Transport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Transport::Ws);
     }
 }
