@@ -14,6 +14,46 @@ use crate::state::TaskStore;
 const LLM_API_URL: &str = "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions";
 const LLM_MODEL: &str = "deepseek-v4-flash";
 
+// ============================================================
+// 查询意图分类（类型层准备）
+// ============================================================
+
+/// 查询意图分类 — 轻量启发式
+///
+/// 借鉴：yologdev/yoyo-evolve — "selective Exa deep search for synthesis/comparison
+/// queries" (Day 118)：yoyo 新增查询意图分类，仅对综合/比较类查询触发深度搜索，
+/// 避免简单查询浪费 API 调用。
+///
+/// 多步路由（Comparison/Synthesis 走拆子查询→分别调 LLM→聚合）属架构级改动，
+/// 按 06-14 / 06-15 / 06-20 / 06-21 / 06-22 / 06-24 既定先例推迟。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentType {
+    /// 普通查询 — 单次 LLM 调用即可
+    Simple,
+    /// 比较类 — 含 "比较/对比/vs/哪个更好/compare" 等关键词
+    Comparison,
+    /// 综合类 — 含 "总结/综述/分析/summarize/analyze" 等关键词
+    Synthesis,
+}
+
+/// 对用户文本做轻量意图分类（启发式关键词匹配，大小写不敏感）
+pub fn classify_intent(text: &str) -> IntentType {
+    let lower = text.to_lowercase();
+    let comparison_keywords = [
+        "比较", "对比", "vs", "哪个更好", "compare", "which is better", "difference",
+    ];
+    let synthesis_keywords = [
+        "总结", "综述", "分析", "summarize", "analyze", "synthesis", "summary", "analysis",
+    ];
+    if comparison_keywords.iter().any(|kw| lower.contains(kw)) {
+        IntentType::Comparison
+    } else if synthesis_keywords.iter().any(|kw| lower.contains(kw)) {
+        IntentType::Synthesis
+    } else {
+        IntentType::Simple
+    }
+}
+
 /// q-body A2A 处理器
 pub struct QBodyHandler {
     pub task_store: TaskStore,
@@ -244,5 +284,32 @@ impl QBodyHandler {
             "nextPageToken": null,
         });
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_simple() {
+        assert_eq!(classify_intent("hello"), IntentType::Simple);
+        assert_eq!(classify_intent("what can you do"), IntentType::Simple);
+        assert_eq!(classify_intent("你好"), IntentType::Simple);
+    }
+
+    #[test]
+    fn test_classify_comparison() {
+        assert_eq!(classify_intent("比较 A 和 B"), IntentType::Comparison);
+        assert_eq!(classify_intent("Rust vs Go"), IntentType::Comparison);
+        assert_eq!(classify_intent("which is better?"), IntentType::Comparison);
+        assert_eq!(classify_intent("COMPARE these two"), IntentType::Comparison);
+    }
+
+    #[test]
+    fn test_classify_synthesis() {
+        assert_eq!(classify_intent("总结一下今天的工作"), IntentType::Synthesis);
+        assert_eq!(classify_intent("analyze the data"), IntentType::Synthesis);
+        assert_eq!(classify_intent("please summarize this"), IntentType::Synthesis);
     }
 }
