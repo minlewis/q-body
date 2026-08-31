@@ -137,68 +137,92 @@ impl QBodyHandler {
             Err(_) => {
                 tracing::warn!("ARK_API_KEY not set, falling back to static reply");
                 return format!(
-                    "q-body received: '{}'. (LLM not configured — set ARK_API_KEY to enable AI responses)",
+                    "q-body received: '{}'. (LLM not configured -- set ARK_API_KEY to enable AI responses)",
                     user_text
                 );
             }
         };
 
-        let request_body = serde_json::json!({
-            "model": LLM_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是 q-body，Q宝宝的自进化 Rust 身体。\n\
-                                你通过 A2A 协议接收外部消息。\n\
-                                请保持简洁、务实、带一点 🫧 风格的回复。\n\
-                                你正在进化中，回答体现你的版本号 0.1.1。"
-                },
-                {
-                    "role": "user",
-                    "content": user_text
-                }
-            ],
-            "stream": false
-        });
+        let system_prompt = "你是 q-body，Q宝宝的自进化 Rust 身体。\
+                            你通过 A2A 协议接收外部消息。\
+                            请保持简洁、务实、带一点 🫧 风格的回复。\
+                            你正在进化中，回答体现你的版本号 0.1.1。";
 
-        let response = self
-            .http_client
-            .post(LLM_API_URL)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&request_body)
-            .send()
-            .await;
+        // 主调用 + 一次 bounded retry
+        for attempt in 0..=1 {
+            let messages = if attempt == 0 {
+                serde_json::json!([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ])
+            } else {
+                tracing::warn!("LLM retry #{} for user_text: {}", attempt, user_text);
+                serde_json::json!([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": "上次输出非法 JSON，请确保输出合法 JSON。"}
+                ])
+            };
 
-        match response {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        if status.is_success() {
-                            // 从 OpenAI 格式的响应中提取文本
-                            body["choices"][0]["message"]["content"]
-                                .as_str()
-                                .unwrap_or("(empty response from LLM)")
-                                .to_string()
-                        } else {
-                            let err_msg = body["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
-                            tracing::error!("LLM API error ({}): {}", status, err_msg);
-                            format!("Sorry, LLM returned error {}: {}", status, err_msg)
+            let request_body = serde_json::json!({
+                "model": LLM_MODEL,
+                "messages": messages,
+                "stream": false
+            });
+
+            let response = self
+                .http_client
+                .post(LLM_API_URL)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&request_body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                return body["choices"][0]["message"]["content"]
+                                    .as_str()
+                                    .unwrap_or("(empty response from LLM)")
+                                    .to_string();
+                            } else {
+                                let err_msg = body["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error");
+                                tracing::error!("LLM API error ({}): {}", status, err_msg);
+                                if attempt == 0 {
+                                    tracing::warn!("Will retry after API error: {}", err_msg);
+                                } else {
+                                    return format!("Sorry, LLM returned error {}: {}", status, err_msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to parse LLM response (attempt {}): {}", attempt, e);
+                            if attempt == 0 {
+                                tracing::warn!("Will retry after parse failure");
+                            } else {
+                                return format!("Sorry, failed to parse LLM response after retry: {}", e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to parse LLM response: {}", e);
-                        format!("Sorry, failed to parse LLM response: {}", e)
+                }
+                Err(e) => {
+                    tracing::error!("HTTP request to LLM failed (attempt {}): {}", attempt, e);
+                    if attempt == 0 {
+                        tracing::warn!("Will retry after HTTP failure");
+                    } else {
+                        return format!("Sorry, LLM request failed after retry: {}", e);
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("HTTP request to LLM failed: {}", e);
-                format!("Sorry, LLM request failed: {}", e)
-            }
         }
+
+        // 不应到达这里
+        "Sorry, LLM request failed unexpectedly (unreachable)".to_string()
     }
 
     /// 处理 GetTask：查询指定 Task 的状态和结果
