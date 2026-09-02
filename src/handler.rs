@@ -14,6 +14,17 @@ use crate::state::TaskStore;
 const LLM_API_URL: &str = "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions";
 const LLM_MODEL: &str = "deepseek-v4-flash";
 
+/// 出站错误消息的 trust-boundary 泄漏模式（借鉴 yoyo-evolve #873 sanitize 审计）
+const LEAK_PATTERNS: &[&str] = &[
+    "api/plan/",      // 内部 LLM 端点路径
+    "ark.cn-beijing", // 内部 provider 域名
+    "ARK_API_KEY",    // 配置键名
+    "Bearer ",        // 凭据前缀
+    "/home/",         // 文件系统路径
+    "/root/",
+    "\\\"",           // serde/reqwest Debug 串（含转义引号，非面向用户的文本）
+];
+
 /// q-body A2A 处理器
 pub struct QBodyHandler {
     pub task_store: TaskStore,
@@ -130,6 +141,17 @@ impl QBodyHandler {
         }
     }
 
+    /// trust-boundary sanitize：错误/拒绝消息出站前审计（借鉴 yoyo-evolve #873）
+    ///
+    /// 命中泄漏模式 → 降级为通用错误回复；完整细节仅保留在服务端 tracing 日志。
+    fn sanitize_err_reply(msg: &str) -> String {
+        if LEAK_PATTERNS.iter().any(|p| msg.contains(p)) {
+            "(internal error, details logged)".into()
+        } else {
+            msg.into()
+        }
+    }
+
     /// 调 deepseek-v4-flash（火山引擎）
     async fn query_llm(&self, user_text: &str) -> String {
         let api_key = match std::env::var("ARK_API_KEY") {
@@ -137,7 +159,7 @@ impl QBodyHandler {
             Err(_) => {
                 tracing::warn!("ARK_API_KEY not set, falling back to static reply");
                 return format!(
-                    "q-body received: '{}'. (LLM not configured — set ARK_API_KEY to enable AI responses)",
+                    "q-body received: '{}'. (LLM not configured — AI responses disabled)",
                     user_text
                 );
             }
@@ -185,18 +207,24 @@ impl QBodyHandler {
                                 .as_str()
                                 .unwrap_or("unknown error");
                             tracing::error!("LLM API error ({}): {}", status, err_msg);
-                            format!("Sorry, LLM returned error {}: {}", status, err_msg)
+                            Self::sanitize_err_reply(&format!(
+                                "Sorry, LLM returned error {}: {}",
+                                status, err_msg
+                            ))
                         }
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse LLM response: {}", e);
-                        format!("Sorry, failed to parse LLM response: {}", e)
+                        Self::sanitize_err_reply(&format!(
+                            "Sorry, failed to parse LLM response: {}",
+                            e
+                        ))
                     }
                 }
             }
             Err(e) => {
                 tracing::error!("HTTP request to LLM failed: {}", e);
-                format!("Sorry, LLM request failed: {}", e)
+                Self::sanitize_err_reply(&format!("Sorry, LLM request failed: {}", e))
             }
         }
     }
@@ -244,5 +272,69 @@ impl QBodyHandler {
             "nextPageToken": null,
         });
         serde_json::to_value(JsonRpcResponse::success(request_id, result)).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_error_passes_through() {
+        let msg = "Sorry, LLM request failed: connection refused";
+        assert_eq!(QBodyHandler::sanitize_err_reply(msg), msg);
+    }
+
+    #[test]
+    fn test_internal_endpoint_url_is_scrubbed() {
+        let out = QBodyHandler::sanitize_err_reply(
+            "Sorry, LLM returned error 401: POST https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions denied",
+        );
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_provider_domain_is_scrubbed() {
+        let out = QBodyHandler::sanitize_err_reply(
+            "Sorry, request failed: dns error resolving ark.cn-beijing",
+        );
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_config_key_name_is_scrubbed() {
+        let out = QBodyHandler::sanitize_err_reply(
+            "Sorry, env ARK_API_KEY missing, request failed",
+        );
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_bearer_credential_is_scrubbed() {
+        let out =
+            QBodyHandler::sanitize_err_reply("Sorry, request failed: header Bearer abc123");
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_filesystem_path_is_scrubbed() {
+        let out = QBodyHandler::sanitize_err_reply(
+            "Sorry, failed to parse LLM response: reading /home/ubuntu/.env",
+        );
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_debug_escape_sequence_is_scrubbed() {
+        let out = QBodyHandler::sanitize_err_reply(
+            "Sorry, failed to parse LLM response: expected value at line \\\"1\\\"",
+        );
+        assert_eq!(out, "(internal error, details logged)");
+    }
+
+    #[test]
+    fn test_fallback_reply_has_no_config_key_name() {
+        let reply = "q-body received: 'hi'. (LLM not configured — AI responses disabled)";
+        assert!(!LEAK_PATTERNS.iter().any(|p| reply.contains(p)));
     }
 }
