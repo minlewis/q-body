@@ -32,6 +32,13 @@ mod handler;
 mod state;
 mod validator;
 
+// ============================================================
+// standalone 纯函数模块（learnings / clamp / darkroom 同先例）：
+// cron D 养料回灌产生的独立功能模块，main 上无对应生产接线，
+// 以单测形式维护，待集成主线合入后一行接线。
+// ============================================================
+mod backlog;
+
 use a2a::types::*;
 use handler::QBodyHandler;
 use state::TaskStore;
