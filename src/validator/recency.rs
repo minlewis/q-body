@@ -43,9 +43,10 @@ impl RecencyGuard {
 
     /// 判断当前事件率是否需要 fallback 到 date-range scan
     ///
-    /// 当 `current_rate`（events/day）≤ 阈值时返回 `true`，表示应使用 DateRange 策略。
+    /// 当 `current_rate`（events/day）< 阈值时返回 `true`，表示应使用 DateRange 策略。
+    /// 等于阈值不触发（backlog 语义：「下降到 N/d **以下**」才 fallback）。
     pub fn should_fallback_to_date_scan(&self, current_rate: f64) -> bool {
-        current_rate <= self.events_per_day_threshold
+        current_rate < self.events_per_day_threshold
     }
 
     /// 根据当前事件率选择查询策略
@@ -104,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_at_threshold_uses_fixed_limit() {
-        // 恰好等于阈值 → 不 fallback（≤ 才 fallback，等于不触发）
+        // 恰好等于阈值 → 不 fallback（< 阈值才 fallback，等于不触发）
         let guard = RecencyGuard::default();
         let strategy = guard.select_query_strategy(5.0);
         assert!(matches!(strategy, RecencyQuery::FixedLimit { limit: 100 }));
