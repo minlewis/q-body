@@ -8,6 +8,7 @@
 use uuid::Uuid;
 
 use crate::a2a::types::*;
+use crate::queue::{LlmFailureKind, LlmParseEvent};
 use crate::state::TaskStore;
 
 /// 火山引擎 deepseek-v4-flash 的 API 端点
@@ -206,7 +207,17 @@ impl QBodyHandler {
                             let err_msg = body["error"]["message"]
                                 .as_str()
                                 .unwrap_or("unknown error");
-                            tracing::error!("LLM API error ({}): {}", status, err_msg);
+                            let full_err = format!("LLM API error ({}): {}", status, err_msg);
+
+                            // 结构化计数日志：为 retry 策略提供数据依据
+                            LlmParseEvent::record(
+                                LlmFailureKind::ApiError,
+                                Some(status.as_u16()),
+                                full_err.len(),
+                                &full_err,
+                            );
+
+                            tracing::error!("{}", full_err);
                             Self::sanitize_err_reply(&format!(
                                 "Sorry, LLM returned error {}: {}",
                                 status, err_msg
@@ -214,7 +225,17 @@ impl QBodyHandler {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Failed to parse LLM response: {}", e);
+                        let full_err = format!("Failed to parse LLM response: {}", e);
+
+                        // 结构化计数日志：为 retry 策略提供数据依据
+                        LlmParseEvent::record(
+                            LlmFailureKind::JsonParse,
+                            Some(status.as_u16()),
+                            0,
+                            &full_err,
+                        );
+
+                        tracing::error!("{}", full_err);
                         Self::sanitize_err_reply(&format!(
                             "Sorry, failed to parse LLM response: {}",
                             e
@@ -223,7 +244,17 @@ impl QBodyHandler {
                 }
             }
             Err(e) => {
-                tracing::error!("HTTP request to LLM failed: {}", e);
+                let full_err = format!("HTTP request to LLM failed: {}", e);
+
+                // 结构化计数日志：为 retry 策略提供数据依据
+                LlmParseEvent::record(
+                    LlmFailureKind::HttpRequest,
+                    None,
+                    full_err.len(),
+                    &full_err,
+                );
+
+                tracing::error!("{}", full_err);
                 Self::sanitize_err_reply(&format!("Sorry, LLM request failed: {}", e))
             }
         }
