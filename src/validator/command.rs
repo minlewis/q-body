@@ -246,7 +246,11 @@ mod tests {
         // 用一个肯定不会存在的环境变量名
         let r = scan_rm_command("rm -rf $Q_BODY_NONEXISTENT_VAR_12345/tmp");
         match r {
-            Err(SafetyError::UnresolvedVariable { var_name, suggestion, .. }) => {
+            Err(SafetyError::UnresolvedVariable {
+                var_name,
+                suggestion,
+                ..
+            }) => {
                 assert_eq!(var_name, "Q_BODY_NONEXISTENT_VAR_12345");
                 assert!(suggestion.contains("${Q_BODY_NONEXISTENT_VAR_12345:?}"));
             }

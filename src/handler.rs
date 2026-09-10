@@ -22,7 +22,7 @@ const LEAK_PATTERNS: &[&str] = &[
     "Bearer ",        // 凭据前缀
     "/home/",         // 文件系统路径
     "/root/",
-    "\\\"",           // serde/reqwest Debug 串（含转义引号，非面向用户的文本）
+    "\\\"", // serde/reqwest Debug 串（含转义引号，非面向用户的文本）
 ];
 
 /// q-body A2A 处理器
@@ -50,17 +50,10 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         match method {
-            "SendMessage" | "message/send" => {
-                self.handle_send_message(params, request_id).await
-            }
-            "GetTask" | "tasks/get" => {
-                self.handle_get_task(params, request_id).await
-            }
-            "ListTasks" | "tasks/list" => {
-                self.handle_list_tasks(params, request_id).await
-            }
-            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method))
-                .unwrap(),
+            "SendMessage" | "message/send" => self.handle_send_message(params, request_id).await,
+            "GetTask" | "tasks/get" => self.handle_get_task(params, request_id).await,
+            "ListTasks" | "tasks/list" => self.handle_list_tasks(params, request_id).await,
+            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method)).unwrap(),
         }
     }
 
@@ -71,9 +64,7 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         // 解析参数
-        let req: SendMessageRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: SendMessageRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -102,7 +93,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 working
-        self.task_store.update_status(&task_id, TaskState::working).await;
+        self.task_store
+            .update_status(&task_id, TaskState::working)
+            .await;
 
         // === 核心：调 LLM ===
         let reply = self.query_llm(&user_text).await;
@@ -125,7 +118,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 completed
-        self.task_store.update_status(&task_id, TaskState::completed).await;
+        self.task_store
+            .update_status(&task_id, TaskState::completed)
+            .await;
 
         // 获取完整 Task 并返回
         match self.task_store.get_task(&task_id).await {
@@ -203,9 +198,8 @@ impl QBodyHandler {
                                 .unwrap_or("(empty response from LLM)")
                                 .to_string()
                         } else {
-                            let err_msg = body["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
+                            let err_msg =
+                                body["error"]["message"].as_str().unwrap_or("unknown error");
                             tracing::error!("LLM API error ({}): {}", status, err_msg);
                             Self::sanitize_err_reply(&format!(
                                 "Sorry, LLM returned error {}: {}",
@@ -235,9 +229,7 @@ impl QBodyHandler {
         params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
-        let req: GetTaskRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: GetTaskRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -303,16 +295,14 @@ mod sanitize_tests {
 
     #[test]
     fn test_config_key_name_is_scrubbed() {
-        let out = QBodyHandler::sanitize_err_reply(
-            "Sorry, env ARK_API_KEY missing, request failed",
-        );
+        let out =
+            QBodyHandler::sanitize_err_reply("Sorry, env ARK_API_KEY missing, request failed");
         assert_eq!(out, "(internal error, details logged)");
     }
 
     #[test]
     fn test_bearer_credential_is_scrubbed() {
-        let out =
-            QBodyHandler::sanitize_err_reply("Sorry, request failed: header Bearer abc123");
+        let out = QBodyHandler::sanitize_err_reply("Sorry, request failed: header Bearer abc123");
         assert_eq!(out, "(internal error, details logged)");
     }
 
