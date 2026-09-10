@@ -7,6 +7,7 @@
 
 use uuid::Uuid;
 
+use crate::a2a::cost::{CostJournal, check_cost_warn, estimate_cost_usd};
 use crate::a2a::types::*;
 use crate::state::TaskStore;
 
@@ -29,6 +30,8 @@ const LEAK_PATTERNS: &[&str] = &[
 pub struct QBodyHandler {
     pub task_store: TaskStore,
     pub agent_card: AgentCard,
+    /// 成本警告 journal（借鉴 yoyo-evolve --cost-warn 门控，事件先落账）
+    pub cost_journal: CostJournal,
     /// HTTP 客户端（复用连接，避免每次新建）
     http_client: reqwest::Client,
 }
@@ -38,6 +41,7 @@ impl QBodyHandler {
         Self {
             task_store,
             agent_card,
+            cost_journal: CostJournal::new(),
             http_client: reqwest::Client::new(),
         }
     }
@@ -98,7 +102,7 @@ impl QBodyHandler {
             .await;
 
         // === 核心：调 LLM ===
-        let reply = self.query_llm(&user_text).await;
+        let reply = self.query_llm(&task_id, &user_text).await;
 
         // agent 回复
         let agent_msg = Message {
@@ -147,8 +151,29 @@ impl QBodyHandler {
         }
     }
 
+    /// 成本警告门控（借鉴 yoyo-evolve --cost-warn）：由 usage tokens 估算单次花费，
+    /// 超 QBODY_COST_WARN_USD 阈值时在 cost journal 记一条 cost_warn 事件（只警告不拦截）。
+    /// usage 缺失时按字符数保守估算（1 token ≈ 4 chars）。
+    async fn maybe_cost_warn(&self, source: &str, usage: Option<(u64, u64)>, reply_chars: usize) {
+        let (input_tokens, output_tokens) = usage.unwrap_or((
+            (reply_chars as u64 / 4).max(1),
+            (reply_chars as u64 / 4).max(1),
+        ));
+        let cost = estimate_cost_usd(input_tokens, output_tokens);
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(ev) = check_cost_warn(source, cost, &now) {
+            tracing::warn!(
+                "cost_warn: task {} est ${:.4} > threshold ${:.4}",
+                source,
+                ev.cost_usd,
+                ev.threshold_usd
+            );
+            self.cost_journal.record(ev).await;
+        }
+    }
+
     /// 调 deepseek-v4-flash（火山引擎）
-    async fn query_llm(&self, user_text: &str) -> String {
+    async fn query_llm(&self, source: &str, user_text: &str) -> String {
         let api_key = match std::env::var("ARK_API_KEY") {
             Ok(k) => k,
             Err(_) => {
@@ -193,10 +218,20 @@ impl QBodyHandler {
                     Ok(body) => {
                         if status.is_success() {
                             // 从 OpenAI 格式的响应中提取文本
-                            body["choices"][0]["message"]["content"]
+                            let text = body["choices"][0]["message"]["content"]
                                 .as_str()
                                 .unwrap_or("(empty response from LLM)")
-                                .to_string()
+                                .to_string();
+                            // 成本警告门控（借鉴 yoyo-evolve --cost-warn）：
+                            // usage 缺失时按字符数保守估算，超线只记 journal 不拦截
+                            let usage = body["usage"].as_object().and_then(|u| {
+                                Some((
+                                    u["prompt_tokens"].as_u64()?,
+                                    u["completion_tokens"].as_u64()?,
+                                ))
+                            });
+                            self.maybe_cost_warn(source, usage, text.len()).await;
+                            text
                         } else {
                             let err_msg =
                                 body["error"]["message"].as_str().unwrap_or("unknown error");
