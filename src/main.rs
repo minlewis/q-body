@@ -31,6 +31,7 @@ mod a2a;
 mod evolution_gate;
 mod handler;
 mod state;
+mod trust_input;
 mod validator;
 
 use a2a::types::*;
