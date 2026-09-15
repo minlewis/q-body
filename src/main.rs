@@ -29,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 mod a2a;
 mod evolution_gate;
+mod gate_audit;
 mod handler;
 mod state;
 mod validator;

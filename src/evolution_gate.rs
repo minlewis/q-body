@@ -110,7 +110,19 @@ impl EvolutionGate {
     /// est_tokens > token_budget → OverBudget；
     /// est_value < value_floor → Uneconomical；
     /// 两者都过 → Admit。
+    ///
+    /// 谓词漂移修复（yoyo Day198 同款）：「零 token 申报无效」这一事实
+    /// 原先只由 `require_u64_field` 的 `.filter(|n| *n > 0)` 在 JSON 解析
+    /// 路径把守，本决策函数对直接构造的 `CostEstimate` 放行 0 token ——
+    /// 同一问题两个谓词给出不同答案。在决策点补同语义校验，负路径由
+    /// `gate_audit::audit_no_zero_token_estimate_is_rejected` 钉死。
     pub fn evaluate(&self, estimate: CostEstimate) -> GateDecision {
+        if estimate.est_tokens == 0 {
+            return GateDecision::OverBudget {
+                est_tokens: 0,
+                budget: self.token_budget,
+            };
+        }
         if estimate.est_tokens > self.token_budget {
             return GateDecision::OverBudget {
                 est_tokens: estimate.est_tokens,
