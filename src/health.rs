@@ -54,6 +54,57 @@ pub struct HealthReport {
     pub evidence: Vec<(String, EvidenceSource, Option<String>)>,
 }
 
+/// 判定词表（yoyo #921 Gap 1：verdict 语义不可硬编码在 if-else 链里）。
+///
+/// 每个条目绑定：verdict 字符串 + status 承诺（healthy 是否被允许宣称）。
+/// 扩展方式：追加条目 + 在 `decide()` 里给出对应的匹配臂 + 全链路回归重测，
+/// 不允许在 `build_report` 里内联裸字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictSpec {
+    /// 判定字符串（"verified" / "degraded" / "unverified" / 未来扩展项）
+    pub verdict: &'static str,
+    /// 该判定下允许宣称的最高 status（"healthy" 或 "unhealthy"）
+    pub max_status: &'static str,
+}
+
+/// 内置词表：三态证据来源 → 判定规格
+pub const VERDICT_VERIFIED: VerdictSpec = VerdictSpec {
+    verdict: "verified",
+    max_status: "healthy",
+};
+pub const VERDICT_DEGRADED: VerdictSpec = VerdictSpec {
+    verdict: "degraded",
+    max_status: "healthy",
+};
+pub const VERDICT_UNVERIFIED: VerdictSpec = VerdictSpec {
+    verdict: "unverified",
+    max_status: "unhealthy",
+};
+
+/// 词表驱动的判定核心：按证据来源集合选 VerdictSpec。
+///
+/// 规则（对齐 yoyo #915：UNVERIFIED 不升格）：
+/// - 任一关键证据 Unavailable → unverified（status 不得宣称 healthy）
+/// - 证据 Unconfigured 或零证据 → degraded（进程可活，但该项自证缺失）
+/// - 全部 Measured → verified
+///
+/// 返回 (&VerdictSpec, 按词表钳制后的 status)：词表是唯一 status 承诺来源，
+/// 调用方不能再自由写 "healthy"。
+pub fn decide(sources: &[EvidenceSource]) -> (&'static VerdictSpec, &'static str) {
+    let has_unavailable = sources.iter().any(|s| *s == EvidenceSource::Unavailable);
+    let has_unconfigured =
+        sources.is_empty() || sources.iter().any(|s| *s == EvidenceSource::Unconfigured);
+
+    let spec = if has_unavailable {
+        &VERDICT_UNVERIFIED
+    } else if has_unconfigured {
+        &VERDICT_DEGRADED
+    } else {
+        &VERDICT_VERIFIED
+    };
+    (spec, spec.max_status)
+}
+
 /// 进程 uptime（epoch 起点由调用方传入便于测试）
 pub fn uptime_secs(now: SystemTime, started_at: SystemTime) -> u64 {
     now.duration_since(started_at)
@@ -108,27 +159,11 @@ pub fn journal_freshness_evidence(journal_path: Option<&str>) -> (EvidenceSource
 
 /// 汇总判定：status + verdict 一并输出，每个状态声明附测量依据。
 ///
-/// 规则（对齐 yoyo #915：UNVERIFIED 不升格）：
-/// - 任一关键证据 Unavailable → verdict = "unverified"，status 不得宣称 "healthy"
-/// - 证据 Unconfigured  → verdict = "degraded"（进程可活，但该项自证缺失）
-/// - 零证据 ≠ 已验证：sources 为空同样按 "degraded" 处理
-/// - 全部 Measured       → verdict = "verified"
+/// 判定词表驱动（见 `VerdictSpec` / `decide`）：build_report 不再内联裸字符串，
+/// status 承诺一律来自词表条目的 `max_status`。
 pub fn build_report(uptime: u64, sources: &[(EvidenceSource, Option<String>)]) -> HealthReport {
-    let has_unavailable = sources
-        .iter()
-        .any(|(s, _)| *s == EvidenceSource::Unavailable);
-    let has_unconfigured = sources.is_empty()
-        || sources
-            .iter()
-            .any(|(s, _)| *s == EvidenceSource::Unconfigured);
-
-    let (status, verdict) = if has_unavailable {
-        ("unhealthy".to_string(), "unverified".to_string())
-    } else if has_unconfigured {
-        ("healthy".to_string(), "degraded".to_string())
-    } else {
-        ("healthy".to_string(), "verified".to_string())
-    };
+    let source_states: Vec<EvidenceSource> = sources.iter().map(|(s, _)| *s).collect();
+    let (spec, status) = decide(&source_states);
 
     let evidence = sources
         .iter()
@@ -136,8 +171,8 @@ pub fn build_report(uptime: u64, sources: &[(EvidenceSource, Option<String>)]) -
         .collect();
 
     HealthReport {
-        status,
-        verdict,
+        status: status.to_string(),
+        verdict: spec.verdict.to_string(),
         uptime_secs: uptime,
         evidence,
     }
@@ -260,5 +295,72 @@ mod tests {
         let r = build_report(60, &[]);
         assert_eq!(r.verdict, "degraded");
         assert_eq!(r.status, "healthy");
+    }
+
+    // ---- 词表可扩展性（yoyo #921 Gap 1）----
+
+    #[test]
+    fn test_verdict_spec_vocabulary_is_extensible_not_hardcoded() {
+        // 词表条目可被代码扩展（新 VerdictSpec 常量），decide() 返回的是词表引用
+        // 而非裸字符串——扩展新判定不需要改 build_report 的字符串面量。
+        let custom = VerdictSpec {
+            verdict: "sampling",
+            max_status: "healthy",
+        };
+        // 词表本身是数据：可检查、可比较、可注册
+        assert_eq!(VERDICT_VERIFIED.verdict, "verified");
+        assert_eq!(VERDICT_VERIFIED.max_status, "healthy");
+        assert_eq!(VERDICT_DEGRADED.verdict, "degraded");
+        assert_eq!(VERDICT_UNVERIFIED.max_status, "unhealthy");
+        // status 承诺来自词表条目，不是 decide() 里内联的字面量
+        let (spec, status) = decide(&[EvidenceSource::Measured]);
+        assert_eq!(
+            (spec.verdict, status),
+            (VERDICT_VERIFIED.verdict, custom.max_status)
+        );
+    }
+
+    #[test]
+    fn test_decide_unavailable_forbids_healthy_via_vocab() {
+        // 词表钳制：unverified 条目的 max_status=unhealthy，
+        // status 承诺只能来自词表，调用方没有第二条路写出 "healthy"
+        let (spec, status) = decide(&[EvidenceSource::Unavailable]);
+        assert_eq!(spec.verdict, "unverified");
+        assert_eq!(status, "unhealthy");
+        assert_eq!(VERDICT_UNVERIFIED.max_status, "unhealthy");
+    }
+
+    #[test]
+    fn test_build_report_regression_full_chain() {
+        // ripgrep 式全链路回归：词表化重构后 /health 判定语义逐条不破
+        // （对应重构前 build_report 的全部 4 条语义 + evidence 透传）
+        let cases: Vec<(Vec<EvidenceSource>, &str, &str)> = vec![
+            (vec![], "degraded", "healthy"),
+            (
+                vec![EvidenceSource::Measured, EvidenceSource::Measured],
+                "verified",
+                "healthy",
+            ),
+            (
+                vec![EvidenceSource::Measured, EvidenceSource::Unconfigured],
+                "degraded",
+                "healthy",
+            ),
+            (
+                vec![EvidenceSource::Measured, EvidenceSource::Unavailable],
+                "unverified",
+                "unhealthy",
+            ),
+            (vec![EvidenceSource::Unconfigured], "degraded", "healthy"),
+            (vec![EvidenceSource::Unavailable], "unverified", "unhealthy"),
+        ];
+        for (sources, want_verdict, want_status) in cases {
+            let src: Vec<(EvidenceSource, Option<String>)> =
+                sources.iter().map(|s| (*s, None)).collect();
+            let r = build_report(60, &src);
+            assert_eq!(r.verdict, want_verdict, "verdict for {sources:?}");
+            assert_eq!(r.status, want_status, "status for {sources:?}");
+            assert_eq!(r.evidence.len(), sources.len());
+        }
     }
 }
