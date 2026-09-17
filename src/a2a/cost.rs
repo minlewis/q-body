@@ -111,22 +111,16 @@ mod tests {
 
         clear_env();
         assert_eq!(cost_warn_threshold_usd(), None);
-    }
 
-    #[test]
-    fn test_estimate_cost_basic() {
+        // 估算纯函数（无 env 依赖，可内联在单条测试内）
         // 1M input + 0 output = $1.0；0 + 0.5M output = $1.0
         assert!((estimate_cost_usd(1_000_000, 0) - 1.0).abs() < 1e-9);
         assert!((estimate_cost_usd(0, 500_000) - 1.0).abs() < 1e-9);
         assert!((estimate_cost_usd(1000, 2000) - 0.005).abs() < 1e-9);
-    }
 
-    #[test]
-    fn test_check_warn_threshold_gate_states() {
-        // 单条测试内顺序验证，避免并行测试互相改同一变量
-        clear_env();
-        assert!(check_cost_warn("t", 999.0, "x").is_none()); // 门控关闭不触发
-
+        // 门控状态同样单条内顺序验证 — 09-10 惯例：同键 env 变异的测试并行时互踩
+        // （历史教训：本条曾拆成独立测试，与上面 set/clear 竞态导致阈值读成 None，
+        //  2026-09-17 全量回归抓到 unwrap panic — §22 修复不带复验钩子会回退）
         set_env("0.50");
         assert!(check_cost_warn("t1", 0.49, "2026-09-10T00:00:00Z").is_none());
         assert!(check_cost_warn("t1", 0.50, "2026-09-10T00:00:00Z").is_none()); // 等于阈值不触发
@@ -137,7 +131,9 @@ mod tests {
         assert!((ev.threshold_usd - 0.50).abs() < 1e-9);
         assert_eq!(ev.at, "2026-09-10T00:00:00Z");
 
+        // 门控关闭时不触发
         clear_env();
+        assert!(check_cost_warn("t", 999.0, "x").is_none());
     }
 
     #[tokio::test]
