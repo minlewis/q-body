@@ -56,7 +56,7 @@ const LEAK_PATTERNS: &[&str] = &[
     "Bearer ",        // 凭据前缀
     "/home/",         // 文件系统路径
     "/root/",
-    "\\\"",           // serde/reqwest Debug 串（含转义引号，非面向用户的文本）
+    "\\\"", // serde/reqwest Debug 串（含转义引号，非面向用户的文本）
 ];
 
 /// q-body A2A 处理器
@@ -84,18 +84,60 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         match method {
-            "SendMessage" | "message/send" => {
-                self.handle_send_message(params, request_id).await
-            }
-            "GetTask" | "tasks/get" => {
-                self.handle_get_task(params, request_id).await
-            }
-            "ListTasks" | "tasks/list" => {
-                self.handle_list_tasks(params, request_id).await
-            }
-            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method))
-                .unwrap(),
+            "SendMessage" | "message/send" => self.handle_send_message(params, request_id).await,
+            "GetTask" | "tasks/get" => self.handle_get_task(params, request_id).await,
+            "ListTasks" | "tasks/list" => self.handle_list_tasks(params, request_id).await,
+            "Reflect" | "reflection/score" => self.handle_reflect(params, request_id),
+            _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method)).unwrap(),
         }
+    }
+
+    /// Phase 1 评估闭环入口：反思文本 → 独立评分 → 固化判定
+    ///
+    /// 评分是确定性规则（src/reflect.rs），与 LLM 完全解耦——agent 无法刷分。
+    /// threshold 可选，缺省 0.7（reflect::DEFAULT_THRESHOLD）。
+    fn handle_reflect(
+        &self,
+        params: Option<serde_json::Value>,
+        request_id: serde_json::Value,
+    ) -> serde_json::Value {
+        let text = params
+            .as_ref()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+        let threshold = params
+            .as_ref()
+            .and_then(|p| p.get("threshold"))
+            .and_then(|t| t.as_f64());
+
+        let Some(text) = text else {
+            return serde_json::to_value(JsonRpcError::invalid_params(
+                request_id,
+                "missing required field: text",
+            ))
+            .unwrap();
+        };
+
+        let report = crate::reflect::score_reflection(&text);
+        let th = threshold.unwrap_or(crate::reflect::DEFAULT_THRESHOLD);
+        let verdict = crate::reflect::verdict(&report, th);
+
+        serde_json::to_value(JsonRpcResponse::success(
+            request_id,
+            serde_json::json!({
+                "total": report.total,
+                "items": report.items.iter().map(|i| serde_json::json!({
+                    "name": i.name, "score": i.score, "weight": i.weight,
+                })).collect::<Vec<_>>(),
+                "threshold": th,
+                "verdict": match verdict {
+                    crate::reflect::Verdict::Solidify => "solidify",
+                    crate::reflect::Verdict::Observe => "observe",
+                },
+            }),
+        ))
+        .unwrap()
     }
 
     /// 处理 SendMessage：接收消息 → 创建 Task → 调 LLM → 返回结果
@@ -105,9 +147,7 @@ impl QBodyHandler {
         request_id: serde_json::Value,
     ) -> serde_json::Value {
         // 解析参数
-        let req: SendMessageRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: SendMessageRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -136,7 +176,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 working
-        self.task_store.update_status(&task_id, TaskState::working).await;
+        self.task_store
+            .update_status(&task_id, TaskState::working)
+            .await;
 
         // === 核心：调 LLM ===
         let reply = self.query_llm(&user_text).await;
@@ -159,7 +201,9 @@ impl QBodyHandler {
             .await;
 
         // 标记为 completed
-        self.task_store.update_status(&task_id, TaskState::completed).await;
+        self.task_store
+            .update_status(&task_id, TaskState::completed)
+            .await;
 
         // 获取完整 Task 并返回
         match self.task_store.get_task(&task_id).await {
@@ -329,9 +373,7 @@ impl QBodyHandler {
         params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
-        let req: GetTaskRequest = match params
-            .and_then(|p| serde_json::from_value(p).ok())
-        {
+        let req: GetTaskRequest = match params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(r) => r,
             None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
@@ -397,16 +439,14 @@ mod sanitize_tests {
 
     #[test]
     fn test_config_key_name_is_scrubbed() {
-        let out = QBodyHandler::sanitize_err_reply(
-            "Sorry, env ARK_API_KEY missing, request failed",
-        );
+        let out =
+            QBodyHandler::sanitize_err_reply("Sorry, env ARK_API_KEY missing, request failed");
         assert_eq!(out, "(internal error, details logged)");
     }
 
     #[test]
     fn test_bearer_credential_is_scrubbed() {
-        let out =
-            QBodyHandler::sanitize_err_reply("Sorry, request failed: header Bearer abc123");
+        let out = QBodyHandler::sanitize_err_reply("Sorry, request failed: header Bearer abc123");
         assert_eq!(out, "(internal error, details logged)");
     }
 

@@ -18,11 +18,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State,
     http::{HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
@@ -31,6 +31,7 @@ mod a2a;
 mod evolution_gate;
 mod handler;
 mod queue;
+pub mod reflect;
 mod state;
 mod validator;
 
@@ -64,11 +65,10 @@ async fn jsonrpc_handler(
     if req.jsonrpc != "2.0" {
         return (
             StatusCode::OK,
-            Json(serde_json::to_value(JsonRpcError::invalid_params(
-                req.id,
-                "jsonrpc must be 2.0",
-            ))
-            .unwrap()),
+            Json(
+                serde_json::to_value(JsonRpcError::invalid_params(req.id, "jsonrpc must be 2.0"))
+                    .unwrap(),
+            ),
         );
     }
 
@@ -92,8 +92,7 @@ async fn main() {
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -130,11 +129,7 @@ async fn main() {
             name: "q-body Core".into(),
             description: "核心 A2A 通信能力，用于验证 agent 间协作链路".into(),
             tags: vec!["a2a".into(), "core".into(), "evolution".into()],
-            examples: vec![
-                "hello".into(),
-                "what can you do".into(),
-                "你的能力".into(),
-            ],
+            examples: vec!["hello".into(), "what can you do".into(), "你的能力".into()],
             input_modes: vec!["text".into()],
             output_modes: vec!["text".into()],
         }],
