@@ -29,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 mod a2a;
 mod clamp;
+mod darkroom;
 mod evolution_gate;
 mod handler;
 mod queue;
