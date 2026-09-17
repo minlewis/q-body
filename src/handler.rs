@@ -10,9 +10,42 @@ use uuid::Uuid;
 use crate::a2a::types::*;
 use crate::state::TaskStore;
 
-/// 火山引擎 deepseek-v4-flash 的 API 端点
-const LLM_API_URL: &str = "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions";
-const LLM_MODEL: &str = "deepseek-v4-flash";
+/// 火山引擎 ark 主 provider 的模型名保留为链首条目（见 LLM_PROVIDERS）
+
+/// LLM provider — OpenAI 兼容单端点描述
+///
+/// 借鉴：tashfeenahmed/freellmapi — 单网关后多 provider automatic failover。
+/// freellmapi 的核心设计：请求先打主 provider，超时/5xx/网络错误自动落到
+/// 备用 provider，聚合末端错误返回，避免单点故障直接判定任务失败。
+/// → q-body 对应改法：query_llm 按 LLM_PROVIDERS 链序尝试，前一个失败
+///    （key 缺失 / HTTP 错误 / API 错误 / 解析失败）自动 failover 到下一个。
+#[derive(Debug, Clone, Copy)]
+struct LlmProvider {
+    /// 存放 API key 的环境变量名
+    api_key_env: &'static str,
+    /// OpenAI 兼容 chat completions 端点
+    api_url: &'static str,
+    /// 模型名
+    model: &'static str,
+    /// tracing 日志用短名（仅入日志，不进用户消息，防泄漏）
+    name: &'static str,
+}
+
+/// provider 故障转移链：按序尝试；链首向后兼容现存部署（只配 ARK_API_KEY 也能跑）
+const LLM_PROVIDERS: &[LlmProvider] = &[
+    LlmProvider {
+        api_key_env: "ARK_API_KEY",
+        api_url: "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions",
+        model: "deepseek-v4-flash",
+        name: "ark",
+    },
+    LlmProvider {
+        api_key_env: "DEEPSEEK_API_KEY",
+        api_url: "https://api.deepseek.com/chat/completions",
+        model: "deepseek-chat",
+        name: "deepseek-platform",
+    },
+];
 
 /// 出站错误消息的 trust-boundary 泄漏模式（借鉴 yoyo-evolve #873 sanitize 审计）
 const LEAK_PATTERNS: &[&str] = &[
@@ -152,21 +185,13 @@ impl QBodyHandler {
         }
     }
 
-    /// 调 deepseek-v4-flash（火山引擎）
+    /// 调 LLM：按 LLM_PROVIDERS 链序尝试，任一 provider 失败自动 failover 到下一个
+    ///
+    /// 失败类型（均触发 failover）：API key 缺失 / HTTP 请求失败 / API 非 2xx /
+    /// 响应解析失败。全部 provider 失败 → 返回净化后的最后一条错误。
+    /// 借鉴：tashfeenahmed/freellmapi — 单端点后多 provider automatic failover。
     async fn query_llm(&self, user_text: &str) -> String {
-        let api_key = match std::env::var("ARK_API_KEY") {
-            Ok(k) => k,
-            Err(_) => {
-                tracing::warn!("ARK_API_KEY not set, falling back to static reply");
-                return format!(
-                    "q-body received: '{}'. (LLM not configured — AI responses disabled)",
-                    user_text
-                );
-            }
-        };
-
         let request_body = serde_json::json!({
-            "model": LLM_MODEL,
             "messages": [
                 {
                     "role": "system",
@@ -183,50 +208,91 @@ impl QBodyHandler {
             "stream": false
         });
 
-        let response = self
-            .http_client
-            .post(LLM_API_URL)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&request_body)
-            .send()
-            .await;
+        let mut last_err: Option<String> = None;
 
-        match response {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        if status.is_success() {
-                            // 从 OpenAI 格式的响应中提取文本
-                            body["choices"][0]["message"]["content"]
-                                .as_str()
-                                .unwrap_or("(empty response from LLM)")
-                                .to_string()
-                        } else {
+        for provider in LLM_PROVIDERS {
+            let api_key = match std::env::var(provider.api_key_env) {
+                Ok(k) if !k.trim().is_empty() => k,
+                _ => {
+                    tracing::warn!(
+                        "LLM provider {} skipped: {} not set",
+                        provider.name,
+                        provider.api_key_env
+                    );
+                    last_err = Some(format!(
+                        "LLM provider {} not configured",
+                        provider.name
+                    ));
+                    continue;
+                }
+            };
+
+            let mut body = request_body.clone();
+            body["model"] = serde_json::Value::String(provider.model.to_string());
+
+            let response = self
+                .http_client
+                .post(provider.api_url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                // 从 OpenAI 格式的响应中提取文本
+                                return body["choices"][0]["message"]["content"]
+                                    .as_str()
+                                    .unwrap_or("(empty response from LLM)")
+                                    .to_string();
+                            }
                             let err_msg = body["error"]["message"]
                                 .as_str()
                                 .unwrap_or("unknown error");
-                            tracing::error!("LLM API error ({}): {}", status, err_msg);
-                            Self::sanitize_err_reply(&format!(
+                            tracing::error!(
+                                "LLM API error on {} ({}): {} — failing over",
+                                provider.name,
+                                status,
+                                err_msg
+                            );
+                            last_err = Some(format!(
                                 "Sorry, LLM returned error {}: {}",
                                 status, err_msg
-                            ))
+                            ));
+                            // 5xx/限流 → failover；4xx 是请求自身问题也换 provider 试一次，
+                            // 由末端统一兜底（与 freellmapi 的宽松 failover 语义一致）
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to parse LLM response from {}: {} — failing over",
+                                provider.name,
+                                e
+                            );
+                            last_err = Some(format!(
+                                "Sorry, failed to parse LLM response: {}",
+                                e
+                            ));
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to parse LLM response: {}", e);
-                        Self::sanitize_err_reply(&format!(
-                            "Sorry, failed to parse LLM response: {}",
-                            e
-                        ))
-                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "HTTP request to LLM {} failed: {} — failing over",
+                        provider.name,
+                        e
+                    );
+                    last_err = Some(format!("Sorry, LLM request failed: {}", e));
                 }
             }
-            Err(e) => {
-                tracing::error!("HTTP request to LLM failed: {}", e);
-                Self::sanitize_err_reply(&format!("Sorry, LLM request failed: {}", e))
-            }
         }
+
+        let msg = last_err
+            .unwrap_or_else(|| "LLM provider chain is empty".to_string());
+        Self::sanitize_err_reply(&msg)
     }
 
     /// 处理 GetTask：查询指定 Task 的状态和结果
@@ -336,5 +402,58 @@ mod sanitize_tests {
     fn test_fallback_reply_has_no_config_key_name() {
         let reply = "q-body received: 'hi'. (LLM not configured — AI responses disabled)";
         assert!(!LEAK_PATTERNS.iter().any(|p| reply.contains(p)));
+    }
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_chain_not_empty() {
+        assert!(!LLM_PROVIDERS.is_empty());
+    }
+
+    #[test]
+    fn test_chain_head_keeps_ark_primary() {
+        // 链首向后兼容现存部署：只配 ARK_API_KEY 的环境行为不变
+        assert_eq!(LLM_PROVIDERS[0].api_key_env, "ARK_API_KEY");
+    }
+
+    #[test]
+    fn test_chain_urls_are_https() {
+        for p in LLM_PROVIDERS {
+            assert!(p.api_url.starts_with("https://"), "{} must be https", p.name);
+        }
+    }
+
+    #[test]
+    fn test_chain_names_unique() {
+        // provider 短名用于 tracing 日志，重名会让 failover 归因失真
+        let mut names: Vec<_> = LLM_PROVIDERS.iter().map(|p| p.name).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n);
+    }
+
+    #[test]
+    fn test_env_names_are_key_names_only() {
+        // 链里只允许存环境变量名（键名），任何值形态的字符串都不该出现
+        for p in LLM_PROVIDERS {
+            assert!(
+                p.api_key_env.ends_with("_KEY") || p.api_key_env.ends_with("_TOKEN"),
+                "{} stores more than a key name",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_chain_models_nonempty() {
+        for p in LLM_PROVIDERS {
+            assert!(!p.model.is_empty());
+            assert!(!p.api_url.is_empty());
+        }
     }
 }
