@@ -37,3 +37,26 @@ issue-10, 12, 19, 21, 27, 29, 31, 33, 35, 37, 40, 42, 45(×2), 49, 52, 54, 56, 5
 
 当前 main：1691 行 Rust / 15 src 文件（已达 ≤12 上限）/ 13 依赖（≤15 内）。
 **全合会击穿双上限**——这是逐条裁决而非批量合并的硬理由。
+
+---
+
+## 补充裁决（2026-09-17 第二批，TAO 修订后）
+
+**TAO 宪法修订已合入 main @ d574544**：上限本质是克制的扩展，非死数字；扩展新功能时可解除约束，需三问 + justification。
+
+### issue-39-journal-jsonl-persistence — 复活 ✅
+
+三问：
+1. **接线了吗？** 接——main 上 health.rs `journal_freshness_evidence` 已读取 QBODY_JOURNAL_PATH 的 mtime 作为"记忆泵心跳"证据（E2E 存活探针之一），但 journal 本体不存在，探针永远 Unavailable。journal.jsonl 落地后探针才有真数据可测。这是唯一有运行时接线需求的 journal 族分支。
+2. **能进 SOUL.md 吗？** 不能——JSONL 读写/原子落盘/循环防重是代码逻辑。
+3. **损掉了什么？** 复活时精简：仅取 Journal 核心事件 + persist/load + cycle/seen_state，PredictionEntry/AssessmentEntry 若无接线计划则留在分支记录判例。915 行预计精简到 ~500。
+
+ justification（解除行数约束）：记忆持久化是 TAO「P0=记忆」的正主。
+
+### 其余 10 条 — 关闭记判例 ✅
+
+- issue-77-journal-synthesize / issue-0-snapshot：依赖 39 的超集功能，若无消费方则属"为未来准备"——关闭，待 39 落地后按需重开最小实现
+- issue-17/23/25（seen-state/cycle/consumed 链）：已被 39 内的 cycle_id + seen_state 覆盖
+- v0.1.4（M3）：Anthropic 协议路径有价值，但 M3Config 依赖的 journal-health 语义已由 health.rs 取代；M3 接线单独评估
+- proactive-memory-trigger：spike，记判例不进主干
+- fix/honesty-ci-first-tests：CI yml 部分拆出单独评估，其余关闭
