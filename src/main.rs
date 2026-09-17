@@ -31,6 +31,7 @@ mod a2a;
 mod clamp;
 mod darkroom;
 mod evolution_gate;
+mod gate_audit;
 mod handler;
 mod health;
 mod queue;
