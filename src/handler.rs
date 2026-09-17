@@ -66,6 +66,8 @@ pub struct QBodyHandler {
     pub agent_card: AgentCard,
     /// 成本警告 journal（借鉴 yoyo-evolve --cost-warn 门控，事件先落账）
     pub cost_journal: CostJournal,
+    /// 进化 journal（JSONL 持久化，P0=记忆；QBODY_JOURNAL_PATH 落盘）
+    pub journal: tokio::sync::RwLock<crate::journal::Journal>,
     /// HTTP 客户端（复用连接，避免每次新建）
     http_client: reqwest::Client,
 }
@@ -76,6 +78,7 @@ impl QBodyHandler {
             task_store,
             agent_card,
             cost_journal: CostJournal::new(),
+            journal: tokio::sync::RwLock::new(crate::journal::Journal::new()),
             http_client: reqwest::Client::new(),
         }
     }
@@ -92,8 +95,94 @@ impl QBodyHandler {
             "GetTask" | "tasks/get" => self.handle_get_task(params, request_id).await,
             "ListTasks" | "tasks/list" => self.handle_list_tasks(params, request_id).await,
             "Reflect" | "reflection/score" => self.handle_reflect(params, request_id),
+            "JournalRecord" | "journal/record" => {
+                self.handle_journal_record(params, request_id).await
+            }
             _ => serde_json::to_value(JsonRpcError::method_not_found(request_id, method)).unwrap(),
         }
+    }
+
+    /// Journal 落账入口：养料回灌闭环把进化事件写进 JSONL journal（P0=记忆）
+    ///
+    /// params: { signal: "refactor|dedup|test|perf|bump", source, suggestion,
+    ///           action?, verification? }
+    /// 每次落账后原子 persist 到 QBODY_JOURNAL_PATH（未配置则只记内存）。
+    async fn handle_journal_record(
+        &self,
+        params: Option<serde_json::Value>,
+        request_id: serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(p) = params else {
+            return serde_json::to_value(JsonRpcError::invalid_params(
+                request_id,
+                "missing params",
+            ))
+            .unwrap();
+        };
+
+        let signal = match p
+            .get("signal")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            Some("refactor") => crate::journal::EvolutionSignal::Refactor,
+            Some("dedup") => crate::journal::EvolutionSignal::Dedup,
+            Some("test") => crate::journal::EvolutionSignal::Test,
+            Some("perf") => crate::journal::EvolutionSignal::Perf,
+            Some("bump") => crate::journal::EvolutionSignal::Bump,
+            _ => {
+                return serde_json::to_value(JsonRpcError::invalid_params(
+                    request_id,
+                    "signal must be one of: refactor|dedup|test|perf|bump",
+                ))
+                .unwrap()
+            }
+        };
+        let source = p
+            .get("source")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let suggestion = p
+            .get("suggestion")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let action = p
+            .get("action")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+        let verification = p
+            .get("verification")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+
+        let mut journal = self.journal.write().await;
+        match (action, verification) {
+            (Some(a), Some(v)) => {
+                journal.record_loop(signal.clone(), source, suggestion, a, v)
+            }
+            _ => journal.record(signal.clone(), source, suggestion),
+        }
+
+        // 原子落盘（QBODY_JOURNAL_PATH 未配置则跳过，journal 只在内存）
+        let persisted = if let Ok(path) = std::env::var("QBODY_JOURNAL_PATH") {
+            journal.persist_to_jsonl(&path).is_ok()
+        } else {
+            false
+        };
+        drop(journal);
+
+        serde_json::to_value(JsonRpcResponse::success(
+            request_id,
+            serde_json::json!({
+                "recorded": true,
+                "signal": format!("{:?}", signal).to_lowercase(),
+                "persisted": persisted,
+            }),
+        ))
+        .unwrap()
     }
 
     /// Phase 1 评估闭环入口：反思文本 → 独立评分 → 固化判定
