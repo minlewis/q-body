@@ -32,6 +32,7 @@ mod clamp;
 mod darkroom;
 mod evolution_gate;
 mod handler;
+mod health;
 mod queue;
 pub mod reflect;
 mod state;
@@ -52,6 +53,8 @@ use state::TaskStore;
 /// 共享应用状态
 struct AppState {
     handler: QBodyHandler,
+    /// 进程启动时刻（/health uptime 自证用）
+    started_at: std::time::SystemTime,
 }
 
 // ============================================================
@@ -61,6 +64,32 @@ struct AppState {
 async fn get_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let card = state.handler.agent_card.clone();
     Json(card)
+}
+
+// ============================================================
+// /health 端点 — 健康判定自带测量证据（借鉴 yoyo-evolve #915：
+// verdict 必须内嵌测量依据，UNVERIFIED 不升格）
+// ============================================================
+
+async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use health::{EvidenceSource, build_report, exe_mtime_evidence, journal_freshness_evidence};
+
+    let started = state.started_at;
+    let uptime = health::uptime_secs(std::time::SystemTime::now(), started);
+
+    let exe_src = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from));
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exe_ev = exe_mtime_evidence(exe_src.as_deref(), now_secs);
+    let journal_ev =
+        journal_freshness_evidence(std::env::var("QBODY_JOURNAL_PATH").ok().as_deref());
+
+    let report = build_report(uptime, &[exe_ev, journal_ev]);
+    Json(report)
 }
 
 // ============================================================
@@ -153,7 +182,10 @@ async fn main() {
     let task_store = TaskStore::new();
     let handler = QBodyHandler::new(task_store, agent_card);
 
-    let state = Arc::new(AppState { handler });
+    let state = Arc::new(AppState {
+        handler,
+        started_at: std::time::SystemTime::now(),
+    });
 
     // CORS —— 允许跨域调用
     let cors = CorsLayer::new()
@@ -163,6 +195,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/.well-known/agent-card.json", get(get_agent_card))
+        .route("/health", get(get_health))
         .route("/a2a/jsonrpc", post(jsonrpc_handler))
         .layer(cors)
         .with_state(state);
