@@ -8,6 +8,7 @@
 use uuid::Uuid;
 
 use crate::a2a::types::*;
+use crate::queue::{LlmFailureKind, LlmParseEvent};
 use crate::state::TaskStore;
 
 /// 火山引擎 ark 主 provider 的模型名保留为链首条目（见 LLM_PROVIDERS）
@@ -253,12 +254,21 @@ impl QBodyHandler {
                             let err_msg = body["error"]["message"]
                                 .as_str()
                                 .unwrap_or("unknown error");
-                            tracing::error!(
+
+                            let full_err = format!(
                                 "LLM API error on {} ({}): {} — failing over",
-                                provider.name,
-                                status,
-                                err_msg
+                                provider.name, status, err_msg
                             );
+
+                            // 结构化计数日志：为 retry 策略提供数据依据
+                            crate::queue::LlmParseEvent::record(
+                                crate::queue::LlmFailureKind::ApiError,
+                                Some(status.as_u16()),
+                                full_err.len(),
+                                &full_err,
+                            );
+
+                            tracing::error!("{}", full_err);
                             last_err = Some(format!(
                                 "Sorry, LLM returned error {}: {}",
                                 status, err_msg
@@ -267,11 +277,20 @@ impl QBodyHandler {
                             // 由末端统一兜底（与 freellmapi 的宽松 failover 语义一致）
                         }
                         Err(e) => {
-                            tracing::error!(
+                            let full_err = format!(
                                 "Failed to parse LLM response from {}: {} — failing over",
-                                provider.name,
-                                e
+                                provider.name, e
                             );
+
+                            // 结构化计数日志：为 retry 策略提供数据依据
+                            crate::queue::LlmParseEvent::record(
+                                crate::queue::LlmFailureKind::JsonParse,
+                                Some(status.as_u16()),
+                                0,
+                                &full_err,
+                            );
+
+                            tracing::error!("{}", full_err);
                             last_err = Some(format!(
                                 "Sorry, failed to parse LLM response: {}",
                                 e
@@ -280,11 +299,20 @@ impl QBodyHandler {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
+                    let full_err = format!(
                         "HTTP request to LLM {} failed: {} — failing over",
-                        provider.name,
-                        e
+                        provider.name, e
                     );
+
+                    // 结构化计数日志：为 retry 策略提供数据依据
+                    crate::queue::LlmParseEvent::record(
+                        crate::queue::LlmFailureKind::HttpRequest,
+                        None,
+                        full_err.len(),
+                        &full_err,
+                    );
+
+                    tracing::error!("{}", full_err);
                     last_err = Some(format!("Sorry, LLM request failed: {}", e));
                 }
             }
