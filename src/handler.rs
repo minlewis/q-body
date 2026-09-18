@@ -167,8 +167,9 @@ impl QBodyHandler {
         }
 
         // 原子落盘（QBODY_JOURNAL_PATH 未配置则跳过，journal 只在内存）
+        // persisted 判定用写后回读自验：写成功 + 回读可解析且内容一致才算 true
         let persisted = if let Ok(path) = std::env::var("QBODY_JOURNAL_PATH") {
-            journal.persist_to_jsonl(&path).is_ok()
+            journal.persist_verified_to_jsonl(&path).unwrap_or(false)
         } else {
             false
         };

@@ -423,6 +423,57 @@ impl Journal {
         Ok(())
     }
 
+    /// persist + 写后回读自验钩子（write-then-readback）。
+    ///
+    /// 先执行 `persist_to_jsonl` 落盘，随后立即 `load_from_jsonl` 回读，
+    /// 校验四类状态与内存一致：events / predictions / assessments 数量逐一相等，
+    /// 且 seen_state 的 key 集合与时间戳一致。任何一项不一致都返回 `false`，
+    /// 让「落盘成功」的声明必须以「回读可解析且内容一致」的实测为准，
+    /// 而不是只信写入路径的 Ok(())。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — 撤掉无法重新推导的算术、只信任实测
+    /// （Task 2 指标必须可复现）→ q-body journal 落盘断言改为实测回读。
+    pub fn persist_verified_to_jsonl(&self, path: &str) -> io::Result<bool> {
+        self.persist_to_jsonl(path)?;
+        self.verify_roundtrip(path)
+    }
+
+    /// 写后回读校验核心：从磁盘重载并逐项比对四类状态。
+    ///
+    /// 独立成方法是为了可测性——篡改文件后直接调 `verify_roundtrip`
+    /// 即可构造「落盘成功但内容不一致」的负路径，不必 mock 写入。
+    pub fn verify_roundtrip(&self, path: &str) -> io::Result<bool> {
+        let reloaded = Self::load_from_jsonl(path)?;
+
+        let events_match = reloaded.events.len() == self.events.len()
+            && reloaded
+                .events
+                .iter()
+                .zip(self.events.iter())
+                .all(|(a, b)| a.timestamp == b.timestamp && a.signal == b.signal);
+        let predictions_match = reloaded.predictions.len() == self.predictions.len()
+            && reloaded
+                .predictions
+                .iter()
+                .zip(self.predictions.iter())
+                .all(|(a, b)| a.predicted_at == b.predicted_at && a.prediction == b.prediction);
+        let assessments_match = reloaded.assessments.len() == self.assessments.len()
+            && reloaded
+                .assessments
+                .iter()
+                .zip(self.assessments.iter())
+                .all(|(a, b)| {
+                    a.assessed_at == b.assessed_at && a.next_direction == b.next_direction
+                });
+        let seen_state_match = reloaded.seen_state.len() == self.seen_state.len()
+            && reloaded
+                .seen_state
+                .iter()
+                .all(|(k, v)| self.seen_state.get(k) == Some(v));
+
+        Ok(events_match && predictions_match && assessments_match && seen_state_match)
+    }
+
     /// 从 JSONL 文件加载 Journal 数据。
     ///
     /// 逐行反序列化：events 行 → PredictionEntry → AssessmentEntry → meta 行（Journal）。
@@ -790,6 +841,78 @@ mod tests {
         journal.reset_cycle();
         assert!(journal.events[0].is_consumed());
         assert_eq!(journal.unconsumed_events().len(), 1);
+    }
+
+    #[test]
+    fn test_persist_verified_readback_roundtrip() {
+        let mut journal = Journal::new();
+        journal.record(
+            EvolutionSignal::Refactor,
+            "session 2026-09-17".into(),
+            "add readback hook".into(),
+        );
+        journal.record_loop(
+            EvolutionSignal::Test,
+            "session 2026-09-17".into(),
+            "verified persist".into(),
+            "added persist_verified_to_jsonl".into(),
+            "cargo test passed".into(),
+        );
+        let pred_idx = journal.record_prediction("readback will pass".into());
+        journal.validate_prediction(pred_idx, "passed".into(), "matched".into());
+        journal.record_assessment(1, 0, Some(1.0), "keep hooking write paths".into());
+        journal.mark_seen("source-readback");
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_verified_journal_{}.jsonl", timestamp);
+
+        let ok = journal
+            .persist_verified_to_jsonl(&path)
+            .expect("persist_verified should succeed");
+        assert!(ok, "写后回读四类状态应全部一致");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_verify_roundtrip_detects_tampered_file() {
+        let mut journal = Journal::new();
+        journal.record(
+            EvolutionSignal::Dedup,
+            "session 2026-09-17".into(),
+            "tamper detection".into(),
+        );
+        journal.mark_seen("source-tamper");
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_tampered_journal_{}.jsonl", timestamp);
+
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
+
+        // 负路径 1：文件被截断（事件行丢失）→ 回读不一致必须判 false
+        std::fs::write(&path, "").expect("truncate should succeed");
+        let ok = journal
+            .verify_roundtrip(&path)
+            .expect("load of empty file should not error");
+        assert!(!ok, "截断文件回读事件数不一致，必须判 false");
+
+        // 负路径 2：写入无法解析的垃圾行 → 回读丢事件，同样判 false
+        std::fs::write(&path, "not-valid-json at all\n").expect("write should succeed");
+        let ok = journal
+            .verify_roundtrip(&path)
+            .expect("load of garbage lines should not error");
+        assert!(!ok, "垃圾行回读丢事件，必须判 false");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_persist_verified_missing_dir_is_io_error() {
+        let journal = Journal::new();
+        let result = journal.persist_verified_to_jsonl("/nonexistent_dir_xyz/j.jsonl");
+        assert!(result.is_err(), "目标目录不存在应返回 IO 错误而非 false");
     }
 
     #[test]
