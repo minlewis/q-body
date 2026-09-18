@@ -12,6 +12,12 @@
 //! standalone 模块先例同 learnings/clamp/cost：main 上暂无 SOUL 注入路径，
 //! 注入点落地 main 后一行接线。
 
+// DEBT(unwired): 高影响力输入信任门控，全仓零引用。
+// 注：gate_audit.rs 文档注释称本模块「未合 main」，与事实不符——它已在 main 上。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

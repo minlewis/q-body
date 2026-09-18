@@ -11,6 +11,11 @@
 //! - 事件率 > 阈值 → FixedLimit（固定 LIMIT，高效）
 //! - 事件率 ≤ 阈值 → DateRange（时间范围扫描，准确）
 
+// DEBT(test-only): recency fallback 判定，唯一引用来自 gate_audit.rs 的 `#[cfg(test)]` 模块。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 
 /// Recency guard 配置

@@ -74,7 +74,7 @@ async fn get_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse
 // ============================================================
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    use health::{EvidenceSource, build_report, exe_mtime_evidence, journal_freshness_evidence};
+    use health::{build_report, exe_mtime_evidence, journal_freshness_evidence};
 
     let started = state.started_at;
     let uptime = health::uptime_secs(std::time::SystemTime::now(), started);

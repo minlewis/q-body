@@ -13,6 +13,8 @@ use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 一条健康证据：字段名 + 人可读值 + 机器可比对的原始值
+// DEBT(unwired): /health 当前直接组装 report，未经由本结构体。
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Evidence {
     pub field: String,

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// 默认警告阈值（美元，仅当显式设置 `QBODY_COST_WARN_USD` 时门控才开启）
+// DEBT(unwired): 命名为"默认值"但无任何读取方 —— 门控未设置时是直接关闭，并不回退到本常量。
+#[allow(dead_code)]
 pub const DEFAULT_COST_WARN_USD: f64 = 0.50;
 
 /// 读取成本警告阈值（环境变量门控）。未设置或非法（≤0 / 非数字）→ None（门控关闭）
@@ -48,6 +50,8 @@ impl CostJournal {
     }
 
     /// 读取全部事件（审计用）
+    // DEBT(unwired): 仅单测调用，运行时无审计读取方。
+    #[allow(dead_code)]
     pub async fn events(&self) -> Vec<CostWarnEvent> {
         self.events.read().await.clone()
     }
@@ -78,16 +82,33 @@ pub fn check_cost_warn(source: &str, cost_usd: f64, now_rfc3339: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// 串行化所有改写 `QBODY_COST_WARN_USD` 的测试。
+    ///
+    /// `cargo test` 默认**多线程并行**，而环境变量是进程级共享状态。
+    /// 「在单条测试内顺序验证」只能防住测试*内部*的先后关系，
+    /// 防不住两个测试*之间*交叉改写同一变量 —— 这正是本文件此前
+    /// 并行必挂、`--test-threads=1` 必过的根因。
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // 前一个测试 panic 会毒化锁；这里只用它做互斥，不保护数据不变式，
+        // 故直接取回内部值而非继续传播毒化。
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn set_env(v: &str) {
-        // SAFETY: 单线程测试进程内修改自身进程环境变量，无并发读取
+        // SAFETY: 调用方持有 `env_lock()`，本测试二进制内对该变量的
+        // 改写与读取均在同一把锁下串行，不存在并发访问。
         unsafe {
             std::env::set_var("QBODY_COST_WARN_USD", v);
         }
     }
 
     fn clear_env() {
-        // SAFETY: 同上
+        // SAFETY: 同 `set_env`
         unsafe {
             std::env::remove_var("QBODY_COST_WARN_USD");
         }
@@ -95,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_env_gate_states() {
-        // 单条测试内顺序验证全部 env 门控状态，避免并行测试互相改同一变量
+        let _guard = env_lock();
         clear_env();
         assert_eq!(cost_warn_threshold_usd(), None);
 
@@ -123,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_check_warn_threshold_gate_states() {
-        // 单条测试内顺序验证，避免并行测试互相改同一变量
+        let _guard = env_lock();
         clear_env();
         assert!(check_cost_warn("t", 999.0, "x").is_none()); // 门控关闭不触发
 

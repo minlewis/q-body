@@ -9,6 +9,11 @@
 //! 纯函数 + 单测先行落 standalone 模块；真实 backlog 消费接线（读
 //! ~/.hermes/q-body-backlog.md 的运行时路径）合入 main 后一行接线。
 
+// DEBT(unwired): backlog 水位治理纯函数模块，全仓零引用（main.rs 仅有 `mod backlog;`）。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use chrono::NaiveDate;
 
 /// 默认水位线：PENDING 条目超过 7 天未消费即过期归档

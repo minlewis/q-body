@@ -35,6 +35,9 @@ pub enum EvolutionSignal {
 /// 对应每日养料回灌的完整生命周期：养料从哪来 → 建议怎么改 → 实际改了什么 → 是否验证通过。
 /// 用于把回灌闭环结构化落盘，并为后续 dedup/refactor 候选检测（同类事件≥2 次）提供按阶段计数能力。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// DEBT(unconsumed): journal 的阶段/预测/评估 API 落地时未同步接入消费方。
+// 2026-09-17 裁决曾预测复活时精简到 ~500 行，实际按 915 行原样落地，预测未被复核。
+#[allow(dead_code)]
 pub enum EvolutionStage {
     /// 养料来源
     Source,
@@ -64,6 +67,8 @@ pub struct EvolutionEvent {
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
+// DEBT(unconsumed): 见 EvolutionStage 处说明。
+#[allow(dead_code)]
 impl EvolutionEvent {
     /// 取某阶段的文本内容；Action / Verification 未填时返回 None。
     pub fn stage_text(&self, stage: EvolutionStage) -> Option<&str> {
@@ -105,6 +110,8 @@ pub struct PredictionEntry {
     pub delta: Option<String>,
 }
 
+// DEBT(unconsumed): 见 EvolutionStage 处说明。
+#[allow(dead_code)]
 impl PredictionEntry {
     /// 是否已经走完校验阶段（即 `actual` 已填）。
     pub fn is_validated(&self) -> bool {
@@ -164,6 +171,11 @@ impl Default for Journal {
     }
 }
 
+// DEBT(unconsumed): 本 impl 约 19 个方法（count_by_*/dedup_*/prediction_*/assessment_*
+// /seen_state 族）无任何调用方——运行时只用到 record/persist 路径（接 health 探针）。
+// 块级豁免而非逐方法标注：19 条属性不可读；代价是本 impl 内新增死代码不再被拦，
+// 下一轮裁决 journal API 面时应一并收敛。
+#[allow(dead_code)]
 impl Journal {
     pub fn new() -> Self {
         Self {

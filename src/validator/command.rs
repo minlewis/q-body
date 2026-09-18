@@ -8,6 +8,11 @@
 //! 在参数展开前做静态扫描，命中危险模式就拒绝执行，
 //! 并提示使用 `${VAR:?}` escape hatch（shell 内置的未定义即失败语法）。
 
+// DEBT(test-only): rm -rf 静态预检，唯一引用来自 gate_audit.rs 的 `#[cfg(test)]` 模块。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use std::env;
 use std::fmt;
 

@@ -67,6 +67,12 @@ pub struct AgentInterface {
 // ============================================================
 
 /// 消息中的角色
+// WIRE: 变体名即 JSON 值（无 serde rename），A2A 线格式要求小写 ——
+// 按 clippy 建议改成 UpperCamelCase 会把 "user" 变成 "User"，**破坏协议**。
+// 故此处豁免为有意决策，不是遗漏。
+#[allow(non_camel_case_types)]
+// DEBT(unwired): Message.role 实际用 String，本枚举无调用方。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Role {
     user,
@@ -110,6 +116,9 @@ pub struct Message {
 // ============================================================
 
 /// 任务状态
+// WIRE: 同 `Role` —— 变体名即 A2A 线上的 JSON 值（"submitted"/"working"/...）。
+// 改成 UpperCamelCase 会静默改变对外协议，故有意豁免。
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskState {
     submitted,
