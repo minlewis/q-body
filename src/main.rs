@@ -215,7 +215,7 @@ async fn main() {
         port,
     );
 
-    let sep: String = std::iter::repeat('=').take(50).collect();
+    let sep: String = std::iter::repeat_n('=', 50).collect();
     tracing::info!("{sep}");
     tracing::info!("🚀 q-body A2A Server (Rust) starting...");
     tracing::info!("   Agent Card: http://{addr}/.well-known/agent-card.json");

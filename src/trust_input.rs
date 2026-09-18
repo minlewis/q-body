@@ -178,8 +178,7 @@ mod tests {
     #[test]
     fn test_over_budget_content_marks_budget_ok_false() {
         let big = "x\n".repeat(TAO_MAX_LINES + 1);
-        let ev =
-            audit_injection("SOUL.md", "", &big, "t").expect("first injection must record");
+        let ev = audit_injection("SOUL.md", "", &big, "t").expect("first injection must record");
         assert!(!ev.budget_ok);
         assert_eq!(ev.lines, TAO_MAX_LINES + 1);
     }

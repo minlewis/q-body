@@ -462,26 +462,26 @@ impl Journal {
                 continue;
             }
             // Try to parse as journal metadata
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if val.get("type").and_then(|t| t.as_str()) == Some("__journal_meta__") {
-                    if let Some(cid) = val.get("cycle_id").and_then(|v| v.as_str()) {
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(cid) {
-                            cycle_id = dt.with_timezone(&Utc);
-                        }
-                    }
-                    if let Some(ss) = val.get("seen_state").and_then(|v| v.as_object()) {
-                        for (k, v) in ss {
-                            if let Some(ts) = v.as_str() {
-                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                                    seen_state.insert(k.clone(), dt.with_timezone(&Utc));
-                                }
-                            }
-                        }
-                    }
-                    continue;
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && val.get("type").and_then(|t| t.as_str()) == Some("__journal_meta__")
+            {
+                if let Some(cid) = val.get("cycle_id").and_then(|v| v.as_str())
+                    && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(cid)
+                {
+                    cycle_id = dt.with_timezone(&Utc);
                 }
-                // Skip type markers not recognized
+                if let Some(ss) = val.get("seen_state").and_then(|v| v.as_object()) {
+                    for (k, v) in ss {
+                        if let Some(ts) = v.as_str()
+                            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
+                        {
+                            seen_state.insert(k.clone(), dt.with_timezone(&Utc));
+                        }
+                    }
+                }
+                continue;
             }
+            // Skip type markers not recognized
 
             // Try each type in order
             if let Ok(event) = serde_json::from_str::<EvolutionEvent>(line) {
@@ -847,7 +847,11 @@ mod tests {
             "cargo test passed".into(),
         );
         let pred_idx = journal.record_prediction("下次会加 data-driven 测试".into());
-        journal.validate_prediction(pred_idx, "roundtrip test added".into(), "预测：data-driven；实际：roundtrip → 接近".into());
+        journal.validate_prediction(
+            pred_idx,
+            "roundtrip test added".into(),
+            "预测：data-driven；实际：roundtrip → 接近".into(),
+        );
         journal.record_assessment(2, 0, Some(0.8), "JSONL 持久化+更完善 data-driven".into());
 
         // 标记 seen_state
@@ -858,13 +862,18 @@ mod tests {
         let path = format!("/tmp/test_journal_{}.jsonl", timestamp);
 
         // persist
-        journal.persist_to_jsonl(&path).expect("persist should succeed");
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
 
         // 验证文件存在且非空
         let content = std::fs::read_to_string(&path).expect("should read file");
         assert!(!content.is_empty(), "JSONL file should not be empty");
         let line_count = content.lines().count();
-        assert_eq!(line_count, 5, "2 events + 1 prediction + 1 assessment + 1 meta = 5 lines");
+        assert_eq!(
+            line_count, 5,
+            "2 events + 1 prediction + 1 assessment + 1 meta = 5 lines"
+        );
 
         // load
         let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
@@ -875,7 +884,10 @@ mod tests {
         assert_eq!(loaded.total_assessments(), 1);
 
         // 事件内容
-        let loaded_refactor = loaded.events.iter().find(|e| e.signal == EvolutionSignal::Refactor);
+        let loaded_refactor = loaded
+            .events
+            .iter()
+            .find(|e| e.signal == EvolutionSignal::Refactor);
         assert!(loaded_refactor.is_some());
         assert_eq!(loaded_refactor.unwrap().source, "session 2026-07-07");
 
@@ -914,7 +926,9 @@ mod tests {
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let path = format!("/tmp/test_empty_journal_{}.jsonl", timestamp);
 
-        journal.persist_to_jsonl(&path).expect("persist empty journal should succeed");
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist empty journal should succeed");
 
         let loaded = Journal::load_from_jsonl(&path).expect("load empty journal should succeed");
         assert_eq!(loaded.total_events(), 0);

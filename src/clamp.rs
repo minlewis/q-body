@@ -121,7 +121,7 @@ mod tests {
     fn test_empty_and_single_line() {
         assert_eq!(clamp_content("", 64), "");
         assert_eq!(clamp_content("ok", 64), "ok");
-        assert_eq!(clamp_content(&"q".repeat(999), 16).len() <= 16, true);
+        assert!(clamp_content(&"q".repeat(999), 16).len() <= 16);
     }
 
     #[test]

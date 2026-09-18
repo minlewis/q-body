@@ -29,7 +29,7 @@
 //!    `audit_no_unset_variable_must_be_respected`：变量不存在时 gate 说 no，
 //!    扫描必须拒绝，不得当作已解析放行。
 //!
-//! 4. `trust_input`（feat/backlog-20260912-trust-input-gate @ 38c5a9f，+197 行，**未合 main**）
+//! 4. `trust_input`（`src/trust_input.rs`，196 行，**已在 main**）
 //!    重点排查对象（本条目原文点名）。逐谓词核对：
 //!    - `audit_injection` 谓词 `new_hash == prev_hash → None`：声称回答
 //!      "内容是否变化"，核对的是同一内容的同一 FNV 指纹——键一致，**无漂移**。
@@ -38,8 +38,11 @@
 //!    - 风险点（非漂移，记录在案）：`budget_ok=false` 只落账不拦截是
 //!      有意设计（P0=journal 记忆优先，同 cost_warn 哲学），不是
 //!      "ignores a no"——no 被记录为事实而非被吞掉。
-//!    该分支内容未进 main，按 08-05/09-02 先例本审计不覆盖其测试，
-//!    结论以上述人工核对为准；分支合入后本模块可补对应用例。
+//!
+//!    订正（2026-09-18）：本条目原文称该分支「未合 main」，与事实不符——
+//!    `src/trust_input.rs` 已在 main 上（196 行），但全仓零引用，
+//!    见其 `DEBT(unwired)` 台账。上述人工核对结论不变；
+//!    补对应用例待该模块真正接线后进行。
 
 #[cfg(test)]
 mod audit_tests {

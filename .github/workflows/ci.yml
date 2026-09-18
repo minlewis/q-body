@@ -1,0 +1,68 @@
+name: CI
+
+# 为什么存在这个文件（2026-09-18）
+#
+# 在此之前 q-body 有 4860 行 Rust、127 个测试，却没有任何 CI。
+# 直接后果（全部为实测，非推断）：
+#   - main 上长期躺着一个并行必挂的测试（a2a::cost env 竞态），无人知晓
+#   - `cargo build` 产生 69 条警告，其中 7 个模块声明了却零调用
+#   - rustfmt 残留反复堆积，需要专门的 chore 提交回头清理
+#
+# 仓库此前唯一的 workflow 是 Copilot Code Review —— 它是**建议型**的：
+# 留下评论，但不阻止任何事。本文件是**阻断型**的。这个区别是重点：
+# 把任何一步改成 continue-on-error，就等于把它退化回建议，这个闸门也就白装了。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: build / test / lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 格式：仓库历史上反复出现 "rustfmt residue" 清理提交，
+      # 说明缺的是闸门而非意愿。
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose
+
+      # clippy：`--all-targets` 覆盖 lib/bins/tests/benches/examples。
+      #
+      # 注意它**已经包含**不带 cfg(test) 的 bin target —— 所以「只在测试里
+      # 活着」的模块（例如 evolution_gate、validator::*，其唯一引用来自
+      # gate_audit.rs 的 #[cfg(test)] 块）同样会被它报成 dead_code。
+      #
+      # 本文件初稿曾额外加一步不带 --all-targets 的 clippy，理由是「只有它
+      # 才照得出仅靠测试续命的模块」。实测推翻了该理由：注入一个只被单测
+      # 引用的探针模块后，两种模式都以 exit 101 拦截。既然 `cargo clippy`
+      # 是 `--all-targets` 的子集，那一步就是冗余，已删。
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings

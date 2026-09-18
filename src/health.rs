@@ -93,9 +93,8 @@ pub const VERDICT_UNVERIFIED: VerdictSpec = VerdictSpec {
 /// 返回 (&VerdictSpec, 按词表钳制后的 status)：词表是唯一 status 承诺来源，
 /// 调用方不能再自由写 "healthy"。
 pub fn decide(sources: &[EvidenceSource]) -> (&'static VerdictSpec, &'static str) {
-    let has_unavailable = sources.iter().any(|s| *s == EvidenceSource::Unavailable);
-    let has_unconfigured =
-        sources.is_empty() || sources.iter().any(|s| *s == EvidenceSource::Unconfigured);
+    let has_unavailable = sources.contains(&EvidenceSource::Unavailable);
+    let has_unconfigured = sources.is_empty() || sources.contains(&EvidenceSource::Unconfigured);
 
     let spec = if has_unavailable {
         &VERDICT_UNVERIFIED

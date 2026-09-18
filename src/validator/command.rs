@@ -100,7 +100,7 @@ pub fn extract_variables(cmd: &str) -> Vec<String> {
                     let inner = &cmd[i + 2..i + 2 + end];
                     // 取 :? 或 :- 等修饰符之前的部分作为变量名
                     let name = inner
-                        .split(|c: char| c == ':' || c == '-' || c == '+' || c == '?')
+                        .split([':', '-', '+', '?'])
                         .next()
                         .unwrap_or(inner)
                         .trim();
