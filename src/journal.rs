@@ -489,11 +489,93 @@ impl Journal {
             seen_state,
         })
     }
+
+    /// SOUL 注入切片：从 events 尾部（最新优先）按字符预算取条目，勿全量。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — #886 arg-gated 分档（查询/注入类
+    /// 零成本直达，计费路径才写代码）。TAO P0 后半的消费端：journal JSONL
+    /// core 落地后，LLM system prompt 注入 journal 尾部预算切片而非全量历史。
+    ///
+    /// 规则：从最新事件往前逐条计入，单条完整纳入（不做条内截断），
+    /// 超出 `max_chars` 即停；返回按时间升序拼接的切片（ oldest first ），
+    /// 即「最近 N 条按原始顺序」。空 journal 或 max_chars == 0 返回空串。
+    pub fn soul_context_slice(&self, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let mut picked: Vec<&EvolutionEvent> = Vec::new();
+        let mut used = 0usize;
+        for ev in self.events.iter().rev() {
+            let cost = ev.suggestion.chars().count() + ev.source.chars().count() + 32;
+            if used + cost > max_chars {
+                break;
+            }
+            used += cost;
+            picked.push(ev);
+        }
+        picked
+            .iter()
+            .rev()
+            .map(|ev| {
+                format!(
+                    "- [{}] {:?} from {}: {}",
+                    ev.timestamp.format("%m-%d"),
+                    ev.signal,
+                    ev.source,
+                    ev.suggestion
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_soul_slice_empty_journal_returns_empty() {
+        let j = Journal::new();
+        assert_eq!(j.soul_context_slice(2000), "");
+    }
+
+    #[test]
+    fn test_soul_slice_zero_budget_returns_empty() {
+        let mut j = Journal::new();
+        j.record(EvolutionSignal::Test, "src".into(), "add test".into());
+        assert_eq!(j.soul_context_slice(0), "");
+    }
+
+    #[test]
+    fn test_soul_slice_respects_budget_keeps_newest() {
+        let mut j = Journal::new();
+        // 3 条 suggestion 各 50 字符
+        for i in 0..3 {
+            j.record(
+                EvolutionSignal::Test,
+                format!("src-{}", i),
+                "s".repeat(50),
+            );
+        }
+        // 预算只够 1 条（50+5+32=87）
+        let slice = j.soul_context_slice(100);
+        assert!(slice.contains("s".repeat(50).as_str()));
+        assert!(slice.contains("src-2"), "最新一条必须被保留");
+        assert!(!slice.contains("src-0"), "最老条目应被预算挤出");
+        assert!(slice.len() <= 100 + 32, "拼接后不得显著超预算");
+    }
+
+    #[test]
+    fn test_soul_slice_preserves_chronological_order() {
+        let mut j = Journal::new();
+        j.record(EvolutionSignal::Dedup, "a".into(), "first".into());
+        j.record(EvolutionSignal::Perf, "b".into(), "second".into());
+        let slice = j.soul_context_slice(2000);
+        let first = slice.find("first").expect("first present");
+        let second = slice.find("second").expect("second present");
+        assert!(first < second, "切片按时间升序（oldest first）");
+    }
 
     #[test]
     fn test_journal_tracks_evolution_signals() {
