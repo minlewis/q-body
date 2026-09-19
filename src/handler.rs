@@ -350,14 +350,31 @@ impl QBodyHandler {
     /// 响应解析失败。全部 provider 失败 → 返回净化后的最后一条错误。
     /// 借鉴：tashfeenahmed/freellmapi — 单端点后多 provider automatic failover。
     async fn query_llm(&self, source: &str, user_text: &str) -> String {
+        // SOUL 注入（TAO P0 后半消费端）：system prompt 拼上 journal 尾部预算切片，
+        // 勿全量（借鉴 yoyo-evolve #886 arg-gated 分档——注入类零成本直达）。
+        // 空 journal 时退化为原硬编码 prompt。
+        const SOUL_CONTEXT_BUDGET_CHARS: usize = 2000;
+        let soul_slice = self
+            .journal
+            .read()
+            .await
+            .soul_context_slice(SOUL_CONTEXT_BUDGET_CHARS);
+        let mut system_prompt = String::from(
+            "你是 q-body，Q宝宝的自进化 Rust 身体。\n\
+             你通过 A2A 协议接收外部消息。\n\
+             请保持简洁、务实、带一点 🫧 风格的回复。\n\
+             你正在进化中，回答体现你的版本号 0.1.1。",
+        );
+        if !soul_slice.is_empty() {
+            system_prompt.push_str("\n\n最近进化事件（journal 尾部预算切片）：\n");
+            system_prompt.push_str(&soul_slice);
+        }
+
         let request_body = serde_json::json!({
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是 q-body，Q宝宝的自进化 Rust 身体。\n\
-                                你通过 A2A 协议接收外部消息。\n\
-                                请保持简洁、务实、带一点 🫧 风格的回复。\n\
-                                你正在进化中，回答体现你的版本号 0.1.1。"
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
