@@ -72,6 +72,10 @@ impl TaskStore {
     }
 
     /// 标记 Task 为失败
+    // DEBT(unwired): 无任何调用方 —— 即 Task 目前**永远不会**进入 failed 态。
+    // handler 的 LLM 失败路径把错误文本当作正常回复写回 completed。
+    // 这是真实功能缺口，接线属行为变更，本轮（只落 CI 闸门）不改，单独一轮处理。
+    #[allow(dead_code)]
     pub async fn fail_task(&self, task_id: &str, error: &str) {
         let mut store = self.tasks.write().await;
         if let Some(task) = store.get_mut(task_id) {

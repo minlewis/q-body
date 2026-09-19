@@ -12,6 +12,12 @@
 //! 对应 backlog 2026-08-29 — P0（issue #96）。
 //! 类型层准备；handler.rs 运行时接线按既定先例推迟。
 
+// DEBT(test-only): cost-estimate 前置闸门，唯一引用来自 gate_audit.rs 的 `#[cfg(test)]` 模块。
+// 即：本模块在 release 构建中完全不可达，仅靠测试「续命」。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use std::fmt;
 
 /// 成本申报字段缺失或非法时使用的统一字段名常量

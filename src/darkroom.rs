@@ -13,6 +13,11 @@
 //! - change_freq    改动频率：越高越暗（归一化到 max 频率）
 //! - days_since_probe 距上次盲测天数：越久越暗（cap 到 30 天封顶）
 
+// DEBT(unwired): 模块暗度排名，全仓零引用。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 /// 单个模块的暗度输入
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleDarkness {

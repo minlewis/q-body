@@ -1,15 +1,15 @@
+//! Contract mirrored from the git-native executor's neutralisation layer
+//! (`~/.hermes/skills/q-baby-self-check/scripts/git-native-batch-merge.py` run()).
+//!
+//! q-body itself does not shell out to git; these tests pin the env-overwrite
+//! semantics the executor must satisfy, so a future regression in the executor
+//! contract is caught by a repo-level test instead of a Sunday surprise.
+//!
+//! Source of truth: tests/repro/threat-repro-git-config.py and
+//! tests/repro/threat-repro-git-env.py (reproduce FIRST, yoyo Day191).
+
 use std::collections::HashMap;
 use std::process::Command;
-
-/// Contract mirrored from the git-native executor's neutralisation layer
-/// (`~/.hermes/skills/q-baby-self-check/scripts/git-native-batch-merge.py` run()).
-///
-/// q-body itself does not shell out to git; these tests pin the env-overwrite
-/// semantics the executor must satisfy, so a future regression in the executor
-/// contract is caught by a repo-level test instead of a Sunday surprise.
-///
-/// Source of truth: tests/repro/threat-repro-git-config.py and
-/// tests/repro/threat-repro-git-env.py (reproduce FIRST, yoyo Day191).
 
 fn neutral_env(base: HashMap<String, String>) -> HashMap<String, String> {
     let mut env = base;
@@ -88,7 +88,7 @@ fn neutral_env_disables_fsmonitor_and_ext_protocol() {
 fn neutral_env_preserves_path_and_home() {
     // overwrite-by-whitelist: only GIT_CONFIG* touched, everything else survives
     let n = neutral_env(base_env());
-    assert!(n.get("PATH").map_or(false, |p| !p.is_empty()));
+    assert!(n.get("PATH").is_some_and(|p| !p.is_empty()));
     assert!(n.contains_key("HOME"));
 }
 

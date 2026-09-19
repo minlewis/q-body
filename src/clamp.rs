@@ -10,6 +10,11 @@
 //! skills.rs 合入 main 后在组装点一行接线：
 //! `let content = clamp::clamp_content(&content, clamp::DEFAULT_MAX_LINE_BYTES);`
 
+// DEBT(unwired): per-line 截断保护，prompt 组装路径从未调用。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 /// 默认单行字节上限：8 KB
 pub const DEFAULT_MAX_LINE_BYTES: usize = 8 * 1024;
 
@@ -116,7 +121,7 @@ mod tests {
     fn test_empty_and_single_line() {
         assert_eq!(clamp_content("", 64), "");
         assert_eq!(clamp_content("ok", 64), "ok");
-        assert_eq!(clamp_content(&"q".repeat(999), 16).len() <= 16, true);
+        assert!(clamp_content(&"q".repeat(999), 16).len() <= 16);
     }
 
     #[test]

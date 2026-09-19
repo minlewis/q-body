@@ -9,6 +9,11 @@
 //! 纯函数 + 单测先行落 standalone 模块；真实 backlog 消费接线（读
 //! ~/.hermes/q-body-backlog.md 的运行时路径）合入 main 后一行接线。
 
+// DEBT(unwired): backlog 水位治理纯函数模块，全仓零引用（main.rs 仅有 `mod backlog;`）。
+// 处置：本轮只落 CI 闸门、不做删留裁决（见 plan 方向 A）。
+// 闸门生效后，新增死代码会被直接拦下；存量债务在下一轮按实据逐条裁决。
+#![allow(dead_code)]
+
 use chrono::NaiveDate;
 
 /// 默认水位线：PENDING 条目超过 7 天未消费即过期归档
@@ -113,7 +118,9 @@ fn inline_title(item: &str) -> String {
         .unwrap_or(s.len());
     // match_indices 返回 char boundary 索引
     let head = s[..cut].trim_end();
-    let head = head.trim_end_matches(&['—', '-', '>', '~', ' ', '，'][..]).trim_end();
+    let head = head
+        .trim_end_matches(&['—', '-', '>', '~', ' ', '，'][..])
+        .trim_end();
     head.to_string()
 }
 
@@ -138,12 +145,19 @@ pub fn parse_backlog(md: &str) -> Vec<BacklogEntry> {
                          title: &Option<String>,
                          inline: usize| {
         // section 级 PENDING 且没有内联项 → 产出 section 级条目
-        if status.is_pending() && inline == 0 {
-            if let Some(d) = date {
-                let title = title.clone().unwrap_or_else(|| "(section 级 PENDING)".into());
-                if !title.is_empty() {
-                    out.push(BacklogEntry { date: d, title, status: EntryStatus::Pending });
-                }
+        if status.is_pending()
+            && inline == 0
+            && let Some(d) = date
+        {
+            let title = title
+                .clone()
+                .unwrap_or_else(|| "(section 级 PENDING)".into());
+            if !title.is_empty() {
+                out.push(BacklogEntry {
+                    date: d,
+                    title,
+                    status: EntryStatus::Pending,
+                });
             }
         }
     };
@@ -153,7 +167,13 @@ pub fn parse_backlog(md: &str) -> Vec<BacklogEntry> {
         let t = line.trim().trim_start_matches('|').trim();
 
         if line.starts_with("### ") {
-            flush_section(&mut out, section_status, section_date, &section_title, section_inline_pending);
+            flush_section(
+                &mut out,
+                section_status,
+                section_date,
+                &section_title,
+                section_inline_pending,
+            );
             section_date = extract_date(line);
             section_status = EntryStatus::Other;
             section_title = None;
@@ -162,14 +182,23 @@ pub fn parse_backlog(md: &str) -> Vec<BacklogEntry> {
         }
         if t.starts_with("---") {
             // 分隔线 = section 结束
-            flush_section(&mut out, section_status, section_date, &section_title, section_inline_pending);
+            flush_section(
+                &mut out,
+                section_status,
+                section_date,
+                &section_title,
+                section_inline_pending,
+            );
             section_status = EntryStatus::Other;
             section_title = None;
             section_inline_pending = 0;
             continue;
         }
-        if let Some(rest) = t.strip_prefix("**状态**").or_else(|| t.strip_prefix("**Status**")) {
-            let rest = rest.trim_start_matches(|c| c == ':' || c == '：').trim();
+        if let Some(rest) = t
+            .strip_prefix("**状态**")
+            .or_else(|| t.strip_prefix("**Status**"))
+        {
+            let rest = rest.trim_start_matches([':', '：']).trim();
             section_status = EntryStatus::parse(rest);
             continue;
         }
@@ -182,7 +211,11 @@ pub fn parse_backlog(md: &str) -> Vec<BacklogEntry> {
             let date = extract_date(rest).or(section_date);
             let title = inline_title(rest);
             if let (Some(d), false) = (date, title.is_empty()) {
-                out.push(BacklogEntry { date: d, title, status: EntryStatus::Pending });
+                out.push(BacklogEntry {
+                    date: d,
+                    title,
+                    status: EntryStatus::Pending,
+                });
                 section_inline_pending += 1;
             }
             continue;
@@ -195,7 +228,13 @@ pub fn parse_backlog(md: &str) -> Vec<BacklogEntry> {
             }
         }
     }
-    flush_section(&mut out, section_status, section_date, &section_title, section_inline_pending);
+    flush_section(
+        &mut out,
+        section_status,
+        section_date,
+        &section_title,
+        section_inline_pending,
+    );
     out
 }
 
@@ -228,10 +267,10 @@ pub fn plan_drain(entries: &[BacklogEntry], today: NaiveDate, max_age_days: i64)
     }
     let mut consume: Option<BacklogEntry> = plan.keep.first().cloned();
     for e in &plan.keep {
-        if let Some(c) = &consume {
-            if e.date < c.date {
-                consume = Some(e.clone());
-            }
+        if let Some(c) = &consume
+            && e.date < c.date
+        {
+            consume = Some(e.clone());
         }
     }
     plan.consume = consume;
@@ -242,7 +281,10 @@ pub fn plan_drain(entries: &[BacklogEntry], today: NaiveDate, max_age_days: i64)
 pub fn archive_markdown(entries: &[BacklogEntry], today: NaiveDate) -> String {
     let mut out = format!("\n## Archived @ {} — 超期未消费（drain）\n\n", today);
     for e in entries {
-        out.push_str(&format!("- [{}，archived @ {}] {}\n", e.date, today, e.title));
+        out.push_str(&format!(
+            "- [{}，archived @ {}] {}\n",
+            e.date, today, e.title
+        ));
     }
     out
 }
@@ -258,10 +300,22 @@ mod backlog_tests {
     #[test]
     fn test_status_parse_variants() {
         assert_eq!(EntryStatus::parse("PENDING"), EntryStatus::Pending);
-        assert_eq!(EntryStatus::parse("DONE-D @ 2026-09-02"), EntryStatus::DoneD);
-        assert_eq!(EntryStatus::parse("DONE-B @ 2026-08-18"), EntryStatus::DoneB);
-        assert_eq!(EntryStatus::parse("DEFERRED-to-Cron-B (deadline)"), EntryStatus::Deferred);
-        assert_eq!(EntryStatus::parse("DONE (09-04 自检执行)"), EntryStatus::DoneD);
+        assert_eq!(
+            EntryStatus::parse("DONE-D @ 2026-09-02"),
+            EntryStatus::DoneD
+        );
+        assert_eq!(
+            EntryStatus::parse("DONE-B @ 2026-08-18"),
+            EntryStatus::DoneB
+        );
+        assert_eq!(
+            EntryStatus::parse("DEFERRED-to-Cron-B (deadline)"),
+            EntryStatus::Deferred
+        );
+        assert_eq!(
+            EntryStatus::parse("DONE (09-04 自检执行)"),
+            EntryStatus::DoneD
+        );
         assert_eq!(EntryStatus::parse("不知道"), EntryStatus::Other);
     }
 
@@ -269,8 +323,15 @@ mod backlog_tests {
     fn test_extract_date_basic_and_guard() {
         assert_eq!(extract_date("### 2026-08-30 — P0"), Some(d(2026, 8, 30)));
         assert_eq!(extract_date("无日期行"), None);
-        assert_eq!(extract_date("id=12026-08-30x"), None, "长数字串中部不得截出假日期");
-        assert_eq!(extract_date("borrow 备注含 2026-09-04 日期"), Some(d(2026, 9, 4)));
+        assert_eq!(
+            extract_date("id=12026-08-30x"),
+            None,
+            "长数字串中部不得截出假日期"
+        );
+        assert_eq!(
+            extract_date("borrow 备注含 2026-09-04 日期"),
+            Some(d(2026, 9, 4))
+        );
     }
 
     #[test]
@@ -327,7 +388,10 @@ P0: backlog 水位治理 — 只追加不排水，借鉴 yoyo drain 模式
         assert_eq!(entries[0].date, d(2026, 8, 29));
         assert_eq!(entries[0].title, "P1: skills.rs census 测试");
         assert_eq!(entries[1].date, d(2026, 8, 31));
-        assert_eq!(entries[1].title, "P0: Cron D 新鲜度校验前置，输入不新鲜直接 exit");
+        assert_eq!(
+            entries[1].title,
+            "P0: Cron D 新鲜度校验前置，输入不新鲜直接 exit"
+        );
         assert_eq!(entries[2].date, d(2026, 9, 4));
         assert_eq!(entries[2].title, "P0: backlog 水位治理 — 只追加不排水");
         assert!(entries.iter().all(|e| e.status == EntryStatus::Pending));
@@ -380,7 +444,10 @@ P0: backlog 水位治理 — 只追加不排水，借鉴 yoyo drain 模式
     #[test]
     fn test_inline_title_strips_decorations() {
         assert_eq!(inline_title("~~P0: 划线标题 ~~"), "P0: 划线标题");
-        assert_eq!(inline_title("P1: 失败链 — 借鉴：a/b — failover"), "P1: 失败链");
+        assert_eq!(
+            inline_title("P1: 失败链 — 借鉴：a/b — failover"),
+            "P1: 失败链"
+        );
         assert_eq!(inline_title("- P0: 无借鉴尾巴"), "P0: 无借鉴尾巴");
     }
 }
