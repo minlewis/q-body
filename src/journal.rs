@@ -86,6 +86,21 @@ impl EvolutionEvent {
     }
 }
 
+/// 单条 skip 事件 — 条件门的显式跳过记录。
+///
+/// 借鉴来源：yologdev/yoyo-evolve — validation event 把 "unhittable" 说出口。
+/// 条件触发型路径被静默跳过时，"没报错 = 没发生" 是自 concealing 的盲区
+/// （SOUL §15 假阴性陷阱的同构问题）。每个 gate 的跳过都应落一条带 reason
+/// 与时间戳的显式记录，让"跳过了什么、为什么跳"可审计可回放。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkipEvent {
+    pub timestamp: DateTime<Utc>,
+    /// 哪个条件门跳过（如 "mark_consumed" / "validate_prediction" / "load_jsonl"）
+    pub gate: String,
+    /// 跳过原因（如 "already_consumed" / "index_out_of_range"）
+    pub reason: String,
+}
+
 /// 预测/校验闭环条目 — 把「当时的判断」与「事后实际结果」绑在同一条记录里。
 ///
 /// 借鉴来源：yologdev/yoyo-evolve — Day 112 `/risk validate`。yoyo-evolve 用
@@ -151,6 +166,8 @@ pub struct Journal {
     predictions: Vec<PredictionEntry>,
     /// 周期评估记录（每个进化周期边界处落盘一条，append-only）。
     assessments: Vec<AssessmentEntry>,
+    /// 条件门显式跳过记录（append-only，不随 reset_cycle 清空）。
+    skips: Vec<SkipEvent>,
     /// 当前 cycle 起始时间戳（每次 `reset_cycle` 刷新到 now）。
     cycle_id: DateTime<Utc>,
     /// 当前 cycle 内已见过的事件 id → 最近一次 mark_seen 时间。
@@ -170,9 +187,32 @@ impl Journal {
             events: Vec::new(),
             predictions: Vec::new(),
             assessments: Vec::new(),
+            skips: Vec::new(),
             cycle_id: Utc::now(),
             seen_state: HashMap::new(),
         }
+    }
+
+    /// 记录一条条件门跳过事件（gate + reason + 时间戳）。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — validation event 把 "unhittable" 说出口。
+    /// 所有条件门的静默跳过路径都应改调本方法，让"跳过了什么"可审计。
+    pub fn record_skip(&mut self, gate: impl Into<String>, reason: impl Into<String>) {
+        self.skips.push(SkipEvent {
+            timestamp: Utc::now(),
+            gate: gate.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// 返回所有 skip 事件（按落盘顺序）。
+    pub fn skips(&self) -> &[SkipEvent] {
+        &self.skips
+    }
+
+    /// skip 事件总数。
+    pub fn total_skips(&self) -> usize {
+        self.skips.len()
     }
 
     /// 记录一条进化事件（仅 Source / Suggestion 两阶段，action/verification 暂缺）。
@@ -234,7 +274,14 @@ impl Journal {
                 event.consumed_at = Some(Utc::now());
                 true
             }
-            _ => false,
+            Some(event) if event.consumed_at.is_some() => {
+                self.record_skip("mark_consumed", "already_consumed");
+                false
+            }
+            _ => {
+                self.record_skip("mark_consumed", "index_out_of_range");
+                false
+            }
         }
     }
 
@@ -289,7 +336,14 @@ impl Journal {
                 entry.delta = Some(delta);
                 true
             }
-            _ => false,
+            Some(entry) if entry.validated_at.is_some() => {
+                self.record_skip("validate_prediction", "already_validated");
+                false
+            }
+            _ => {
+                self.record_skip("validate_prediction", "index_out_of_range");
+                false
+            }
         }
     }
 
@@ -410,6 +464,11 @@ impl Journal {
                 let line = serde_json::to_string(assessment)?;
                 writeln!(file, "{}", line)?;
             }
+            // skips — 条件门跳过事件（append-only，与 events 同生命周期）
+            for skip in &self.skips {
+                let line = serde_json::to_string(skip)?;
+                writeln!(file, "{}", line)?;
+            }
             // journal metadata — write a single "Journal" row with meta fields
             let meta = serde_json::json!({
                 "type": "__journal_meta__",
@@ -441,8 +500,10 @@ impl Journal {
         let mut events = Vec::new();
         let mut predictions = Vec::new();
         let mut assessments = Vec::new();
+        let mut skips = Vec::new();
         let mut cycle_id = Utc::now();
         let mut seen_state = HashMap::new();
+        let mut unrecognized = 0usize;
 
         for line in content.lines() {
             let line = line.trim();
@@ -468,7 +529,8 @@ impl Journal {
                     }
                     continue;
                 }
-                // Skip type markers not recognized
+                // Skip type markers not recognized（非 meta 的合法 JSON 条目行
+                // 需继续走下方三类结构体解析，不在此处计数）
             }
 
             // Try each type in order
@@ -478,13 +540,27 @@ impl Journal {
                 predictions.push(pred);
             } else if let Ok(assessment) = serde_json::from_str::<AssessmentEntry>(line) {
                 assessments.push(assessment);
+            } else if let Ok(skip) = serde_json::from_str::<SkipEvent>(line) {
+                skips.push(skip);
+            } else {
+                // 三类结构体都解析失败 — 静默丢弃升级为显式 skip 事件
+                unrecognized += 1;
             }
+        }
+
+        if unrecognized > 0 {
+            skips.push(SkipEvent {
+                timestamp: Utc::now(),
+                gate: "load_jsonl".into(),
+                reason: format!("unrecognized_line_count={}", unrecognized),
+            });
         }
 
         Ok(Self {
             events,
             predictions,
             assessments,
+            skips,
             cycle_id,
             seen_state,
         })
@@ -893,7 +969,85 @@ mod tests {
         assert_eq!(journal.total_events(), 0);
         assert_eq!(journal.total_predictions(), 0);
         assert_eq!(journal.total_assessments(), 0);
+        assert_eq!(journal.total_skips(), 0);
         assert_eq!(journal.seen_count(), 0);
+    }
+
+    #[test]
+    fn test_skip_events_on_gate_rejections() {
+        // 借鉴：yoyo-evolve validation event — 条件门的每次跳过必须显式落账
+        let mut journal = Journal::new();
+        assert_eq!(journal.total_skips(), 0);
+
+        // mark_consumed：越界 → skip
+        assert!(!journal.mark_consumed(999));
+        // mark_consumed：重复消费 → skip
+        journal.record(
+            EvolutionSignal::Test,
+            "session 2026-09-23".into(),
+            "skip event audit".into(),
+        );
+        assert!(journal.mark_consumed(0));
+        assert!(!journal.mark_consumed(0));
+        // validate_prediction：越界 → skip；重复校验 → skip
+        let idx = journal.record_prediction("p".into());
+        assert!(journal.validate_prediction(idx, "a".into(), "d".into()));
+        assert!(!journal.validate_prediction(idx, "a".into(), "d".into()));
+        assert!(!journal.validate_prediction(999, "a".into(), "d".into()));
+
+        let skips = journal.skips();
+        assert_eq!(skips.len(), 4, "4 次静默跳过应全部落显式 skip 事件");
+        assert_eq!(skips[0].gate, "mark_consumed");
+        assert_eq!(skips[0].reason, "index_out_of_range");
+        assert_eq!(skips[1].gate, "mark_consumed");
+        assert_eq!(skips[1].reason, "already_consumed");
+        assert_eq!(skips[2].gate, "validate_prediction");
+        assert_eq!(skips[2].reason, "already_validated");
+        assert_eq!(skips[3].gate, "validate_prediction");
+        assert_eq!(skips[3].reason, "index_out_of_range");
+        // 每条 skip 事件都带时间戳
+        assert!(skips.iter().all(|s| s.timestamp <= Utc::now()));
+    }
+
+    #[test]
+    fn test_skip_events_persist_and_load_roundtrip() {
+        let mut journal = Journal::new();
+        journal.record_skip("hash_gate", "condition_not_met");
+        journal.record_skip("probe", "already_running");
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_journal_skip_{}.jsonl", timestamp);
+        journal.persist_to_jsonl(&path).expect("persist should succeed");
+
+        let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
+        assert_eq!(loaded.total_skips(), 2);
+        assert_eq!(loaded.skips()[0].gate, "hash_gate");
+        assert_eq!(loaded.skips()[0].reason, "condition_not_met");
+        assert_eq!(loaded.skips()[1].gate, "probe");
+        assert_eq!(loaded.skips()[1].reason, "already_running");
+        assert_eq!(loaded.skips()[0].timestamp, journal.skips()[0].timestamp);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_jsonl_unrecognized_lines_become_skip_event() {
+        // 静默丢弃未识别行 → 升格为一条显式 skip 事件
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_journal_garbage_{}.jsonl", timestamp);
+        std::fs::write(&path, "not json at all\n{\"also\":\"not an entry\"}\n")
+            .expect("write garbage file");
+
+        let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
+        assert_eq!(loaded.total_events(), 0);
+        assert_eq!(loaded.total_skips(), 1, "未识别行应聚合为一条 load_jsonl skip 事件");
+        assert_eq!(loaded.skips()[0].gate, "load_jsonl");
+        assert_eq!(
+            loaded.skips()[0].reason,
+            "unrecognized_line_count=2"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
