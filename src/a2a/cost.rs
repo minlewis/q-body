@@ -53,12 +53,43 @@ impl CostJournal {
     }
 }
 
+/// 定价基准（美元 / 1M tokens）— deepseek-v4-Flash 峰值 cache-miss 保守档，
+/// 对齐官方价目表 2026-08-16 重定价（peak：input $0.44 / output $1.32；
+/// off-peak 减半 $0.22 / $0.66，此处取峰值保守估计）。
+/// 可用环境变量 `QBODY_COST_INPUT_USD_PER_MTOK` / `QBODY_COST_OUTPUT_USD_PER_MTOK`
+/// 覆盖，非法值（≤0 / 非数字）回落默认。
+pub const DEFAULT_INPUT_USD_PER_MTOK: f64 = 0.44;
+pub const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 1.32;
+
+/// 读取单价：env 合法值优先，非法（≤0 / 非数字）或未设置回落默认
+fn price_per_mtok(env_key: &str, default_usd: f64) -> f64 {
+    match std::env::var(env_key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v > 0.0)
+            .unwrap_or(default_usd),
+        Err(_) => default_usd,
+    }
+}
+
+/// input 单价（美元 / 1M tokens），env `QBODY_COST_INPUT_USD_PER_MTOK` 可覆盖
+pub fn input_price_usd_per_mtok() -> f64 {
+    price_per_mtok("QBODY_COST_INPUT_USD_PER_MTOK", DEFAULT_INPUT_USD_PER_MTOK)
+}
+
+/// output 单价（美元 / 1M tokens），env `QBODY_COST_OUTPUT_USD_PER_MTOK` 可覆盖
+pub fn output_price_usd_per_mtok() -> f64 {
+    price_per_mtok("QBODY_COST_OUTPUT_USD_PER_MTOK", DEFAULT_OUTPUT_USD_PER_MTOK)
+}
+
 /// 由 usage tokens 估算单次调用成本（美元）。
 ///
-/// 定价模型：input $1.0 / 1M tokens，output $2.0 / 1M tokens
-/// （deepseek 量级保守估计；估算只用于超线判定，不作为计费依据）。
+/// 定价基准见 [`DEFAULT_INPUT_USD_PER_MTOK`]（估算只用于超线判定，不作为计费依据）。
 pub fn estimate_cost_usd(input_tokens: u64, output_tokens: u64) -> f64 {
-    input_tokens as f64 * 1.0 / 1_000_000.0 + output_tokens as f64 * 2.0 / 1_000_000.0
+    input_tokens as f64 * input_price_usd_per_mtok() / 1_000_000.0
+        + output_tokens as f64 * output_price_usd_per_mtok() / 1_000_000.0
 }
 
 /// 判定是否超线并构造事件；未超线 / 门控关闭 → None
@@ -115,10 +146,44 @@ mod tests {
 
     #[test]
     fn test_estimate_cost_basic() {
-        // 1M input + 0 output = $1.0；0 + 0.5M output = $1.0
-        assert!((estimate_cost_usd(1_000_000, 0) - 1.0).abs() < 1e-9);
-        assert!((estimate_cost_usd(0, 500_000) - 1.0).abs() < 1e-9);
-        assert!((estimate_cost_usd(1000, 2000) - 0.005).abs() < 1e-9);
+        // 默认基准：1M input = $0.44；1M output = $1.32；混合按比例
+        assert!((estimate_cost_usd(1_000_000, 0) - 0.44).abs() < 1e-9);
+        assert!((estimate_cost_usd(0, 1_000_000) - 1.32).abs() < 1e-9);
+        assert!((estimate_cost_usd(500_000, 250_000) - 0.22 - 0.33).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_price_env_override_states() {
+        // 单条测试内顺序验证全部 env 覆盖状态，避免并行测试互相改同一变量
+        unsafe {
+            std::env::remove_var("QBODY_COST_INPUT_USD_PER_MTOK");
+            std::env::remove_var("QBODY_COST_OUTPUT_USD_PER_MTOK");
+        }
+        assert_eq!(input_price_usd_per_mtok(), 0.44);
+        assert_eq!(output_price_usd_per_mtok(), 1.32);
+
+        unsafe {
+            std::env::set_var("QBODY_COST_INPUT_USD_PER_MTOK", "0.10");
+            std::env::set_var("QBODY_COST_OUTPUT_USD_PER_MTOK", "0.20");
+        }
+        assert_eq!(input_price_usd_per_mtok(), 0.10);
+        assert_eq!(output_price_usd_per_mtok(), 0.20);
+        assert!((estimate_cost_usd(1_000_000, 1_000_000) - 0.30).abs() < 1e-9);
+
+        // 非法值回落默认
+        unsafe {
+            std::env::set_var("QBODY_COST_INPUT_USD_PER_MTOK", "abc");
+            std::env::set_var("QBODY_COST_OUTPUT_USD_PER_MTOK", "-1");
+        }
+        assert_eq!(input_price_usd_per_mtok(), 0.44);
+        assert_eq!(output_price_usd_per_mtok(), 1.32);
+
+        unsafe {
+            std::env::remove_var("QBODY_COST_INPUT_USD_PER_MTOK");
+            std::env::remove_var("QBODY_COST_OUTPUT_USD_PER_MTOK");
+        }
+        assert_eq!(input_price_usd_per_mtok(), 0.44);
+        assert_eq!(output_price_usd_per_mtok(), 1.32);
     }
 
     #[test]
