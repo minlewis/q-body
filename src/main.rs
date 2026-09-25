@@ -158,7 +158,8 @@ async fn main() {
             organization: "Q宝宝实验室".into(),
             url: "https://github.com/q-baby".into(),
         }),
-        version: "0.1.0".into(),
+        // 单一事实源：编译期从 Cargo.toml 取版本，杜绝与包版本漂移
+        version: env!("CARGO_PKG_VERSION").into(),
         capabilities: Some(AgentCapabilities {
             streaming: false,
             push_notifications: false,
