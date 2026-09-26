@@ -74,7 +74,10 @@ async fn get_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse
 // ============================================================
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    use health::{EvidenceSource, build_report, exe_mtime_evidence, journal_freshness_evidence};
+    use health::{
+        EvidenceSource, build_report, exe_mtime_evidence, journal_freshness_evidence,
+        journal_line_count_evidence,
+    };
 
     let started = state.started_at;
     let uptime = health::uptime_secs(std::time::SystemTime::now(), started);
@@ -89,8 +92,11 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let exe_ev = exe_mtime_evidence(exe_src.as_deref(), now_secs);
     let journal_ev =
         journal_freshness_evidence(std::env::var("QBODY_JOURNAL_PATH").ok().as_deref());
+    // 证据 3：pump 统计锚定 JSONL 落盘行数（yoyo evt-0028：file reads 替代自报计数）
+    let journal_lc_ev =
+        journal_line_count_evidence(std::env::var("QBODY_JOURNAL_PATH").ok().as_deref());
 
-    let report = build_report(uptime, &[exe_ev, journal_ev]);
+    let report = build_report(uptime, &[exe_ev, journal_ev, journal_lc_ev]);
     Json(report)
 }
 
