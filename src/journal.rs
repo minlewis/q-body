@@ -565,11 +565,183 @@ impl Journal {
             seen_state,
         })
     }
+
+    /// SOUL 注入切片：从 events 尾部（最新优先）按字符预算取条目，勿全量。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — #886 arg-gated 分档（查询/注入类
+    /// 零成本直达，计费路径才写代码）。TAO P0 后半的消费端：journal JSONL
+    /// core 落地后，LLM system prompt 注入 journal 尾部预算切片而非全量历史。
+    ///
+    /// 规则：从最新事件往前逐条计入，单条完整纳入（不做条内截断），
+    /// 超出 `max_chars` 即停；返回按时间升序拼接的切片（ oldest first ），
+    /// 即「最近 N 条按原始顺序」。空 journal 或 max_chars == 0 返回空串。
+    pub fn soul_context_slice(&self, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let mut picked: Vec<&EvolutionEvent> = Vec::new();
+        let mut used = 0usize;
+        for ev in self.events.iter().rev() {
+            let cost = ev.suggestion.chars().count() + ev.source.chars().count() + 32;
+            if used + cost > max_chars {
+                break;
+            }
+            used += cost;
+            picked.push(ev);
+        }
+        picked
+            .iter()
+            .rev()
+            .map(|ev| {
+                format!(
+                    "- [{}] {:?} from {}: {}",
+                    ev.timestamp.format("%m-%d"),
+                    ev.signal,
+                    ev.source,
+                    ev.suggestion
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_soul_slice_empty_journal_returns_empty() {
+        let j = Journal::new();
+        assert_eq!(j.soul_context_slice(2000), "");
+    }
+
+    #[test]
+    fn test_soul_slice_zero_budget_returns_empty() {
+        let mut j = Journal::new();
+        j.record(EvolutionSignal::Test, "src".into(), "add test".into());
+        assert_eq!(j.soul_context_slice(0), "");
+    }
+
+    #[test]
+    fn test_soul_slice_respects_budget_keeps_newest() {
+        let mut j = Journal::new();
+        // 3 条 suggestion 各 50 字符
+        for i in 0..3 {
+            j.record(EvolutionSignal::Test, format!("src-{}", i), "s".repeat(50));
+        }
+        // 预算只够 1 条（50+5+32=87）
+        let slice = j.soul_context_slice(100);
+        assert!(slice.contains("s".repeat(50).as_str()));
+        assert!(slice.contains("src-2"), "最新一条必须被保留");
+        assert!(!slice.contains("src-0"), "最老条目应被预算挤出");
+        assert!(slice.len() <= 100 + 32, "拼接后不得显著超预算");
+    }
+
+    #[test]
+    fn test_soul_slice_preserves_chronological_order() {
+        let mut j = Journal::new();
+        j.record(EvolutionSignal::Dedup, "a".into(), "first".into());
+        j.record(EvolutionSignal::Perf, "b".into(), "second".into());
+        let slice = j.soul_context_slice(2000);
+        let first = slice.find("first").expect("first present");
+        let second = slice.find("second").expect("second present");
+        assert!(first < second, "切片按时间升序（oldest first）");
+    }
+
+    // ---- 序列级 emission-point 测试（issue #110）----
+    // 借鉴：yologdev/yoyo-evolve — #804「测 SEQUENCE 不是单行」：
+    // budget-slice 这类 emission-point 必须在「连续写 N 条」的序列行为上验证，
+    // 单条边界测试不足以覆盖切片语义。
+
+    /// 连续写 N 条后按预算取尾：最新 N-k 条保留、最老 k 条被挤出。
+    #[test]
+    fn test_soul_slice_sequence_keeps_newest_window() {
+        let mut j = Journal::new();
+        // 每条 cost = 50(suggestion) + 8(source) + 32(padding) = 90
+        for i in 0..10 {
+            j.record(EvolutionSignal::Test, format!("src-{}", i), "s".repeat(50));
+        }
+        // 预算恰好够 3 条：270
+        let slice = j.soul_context_slice(270);
+        assert!(
+            slice.contains("src-9") && slice.contains("src-8") && slice.contains("src-7"),
+            "最新 3 条必须全保留"
+        );
+        assert!(!slice.contains("src-6"), "预算外紧邻条目必须被挤出");
+        assert!(!slice.contains("src-0"), "最老条目必须被挤出");
+        // 序列内仍按时间升序
+        let s7 = slice.find("src-7").expect("src-7 present");
+        let s9 = slice.find("src-9").expect("src-9 present");
+        assert!(s7 < s9, "窗口内保持 oldest-first");
+    }
+
+    /// 切片边界：预算掐在两段之间——多一条就超、少一条就有富余。
+    #[test]
+    fn test_soul_slice_sequence_budget_boundary_between_items() {
+        let mut j = Journal::new();
+        // 每条 cost = 10(suggestion) + 3(source "s-N") + 32(padding) = 45
+        for i in 0..4 {
+            j.record(EvolutionSignal::Test, format!("s-{}", i), "x".repeat(10));
+        }
+        // 预算 = 3×45 − 1 = 134：只容 2 条（第 3 条需累计 135 > 134）
+        let slice = j.soul_context_slice(134);
+        assert!(
+            slice.contains("s-3") && slice.contains("s-2"),
+            "最新 2 条全保留"
+        );
+        assert!(
+            !slice.contains("s-1") && !slice.contains("s-0"),
+            "其余全部挤出"
+        );
+        // 预算 +1 = 135：恰好容下第 3 条
+        let slice3 = j.soul_context_slice(135);
+        assert!(slice3.contains("s-1"), "预算恰好多 1 字节即多容 1 条");
+        assert!(!slice3.contains("s-0"), "第 4 条仍被挤出");
+    }
+
+    /// 回读一致性：persist → load 往返后，同一预算的切片逐字节一致。
+    #[test]
+    fn test_soul_slice_sequence_roundtrip_consistency() {
+        let mut j = Journal::new();
+        for i in 0..6 {
+            j.record(
+                EvolutionSignal::Test,
+                format!("rt-{}", i),
+                format!("payload-{}-{}", i, "d".repeat(20)),
+            );
+        }
+        let before = j.soul_context_slice(300);
+        assert!(!before.is_empty());
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_soul_slice_seq_{}.jsonl", timestamp);
+        j.persist_to_jsonl(&path).expect("persist should succeed");
+        let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
+        let after = loaded.soul_context_slice(300);
+
+        assert_eq!(before, after, "往返后同一预算切片必须逐字节一致");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 序列极值：单条超预算（cost > max_chars）→ 整条被拒，切片为空。
+    #[test]
+    fn test_soul_slice_sequence_single_item_over_budget_rejected() {
+        let mut j = Journal::new();
+        j.record(EvolutionSignal::Test, "src".into(), "h".repeat(500));
+        // 预算远小于单条 cost
+        assert_eq!(
+            j.soul_context_slice(100),
+            "",
+            "单条超预算必须整条拒收，返回空串"
+        );
+        // 多条中只有超预算条：同样为空
+        j.record(EvolutionSignal::Perf, "small".into(), "ok".into());
+        let slice = j.soul_context_slice(100);
+        // 遍历从最新开始：small 可容、huge 被拒
+        assert!(slice.contains("ok"), "可容条目正常纳入");
+        assert!(!slice.contains("hhh"), "超预算条目不得部分泄漏");
+    }
 
     #[test]
     fn test_journal_tracks_evolution_signals() {
@@ -911,7 +1083,11 @@ mod tests {
             "cargo test passed".into(),
         );
         let pred_idx = journal.record_prediction("下次会加 data-driven 测试".into());
-        journal.validate_prediction(pred_idx, "roundtrip test added".into(), "预测：data-driven；实际：roundtrip → 接近".into());
+        journal.validate_prediction(
+            pred_idx,
+            "roundtrip test added".into(),
+            "预测：data-driven；实际：roundtrip → 接近".into(),
+        );
         journal.record_assessment(2, 0, Some(0.8), "JSONL 持久化+更完善 data-driven".into());
 
         // 标记 seen_state
@@ -922,13 +1098,18 @@ mod tests {
         let path = format!("/tmp/test_journal_{}.jsonl", timestamp);
 
         // persist
-        journal.persist_to_jsonl(&path).expect("persist should succeed");
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
 
         // 验证文件存在且非空
         let content = std::fs::read_to_string(&path).expect("should read file");
         assert!(!content.is_empty(), "JSONL file should not be empty");
         let line_count = content.lines().count();
-        assert_eq!(line_count, 5, "2 events + 1 prediction + 1 assessment + 1 meta = 5 lines");
+        assert_eq!(
+            line_count, 5,
+            "2 events + 1 prediction + 1 assessment + 1 meta = 5 lines"
+        );
 
         // load
         let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
@@ -939,7 +1120,10 @@ mod tests {
         assert_eq!(loaded.total_assessments(), 1);
 
         // 事件内容
-        let loaded_refactor = loaded.events.iter().find(|e| e.signal == EvolutionSignal::Refactor);
+        let loaded_refactor = loaded
+            .events
+            .iter()
+            .find(|e| e.signal == EvolutionSignal::Refactor);
         assert!(loaded_refactor.is_some());
         assert_eq!(loaded_refactor.unwrap().source, "session 2026-07-07");
 
@@ -1056,7 +1240,9 @@ mod tests {
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let path = format!("/tmp/test_empty_journal_{}.jsonl", timestamp);
 
-        journal.persist_to_jsonl(&path).expect("persist empty journal should succeed");
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist empty journal should succeed");
 
         let loaded = Journal::load_from_jsonl(&path).expect("load empty journal should succeed");
         assert_eq!(loaded.total_events(), 0);
