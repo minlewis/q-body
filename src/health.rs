@@ -157,6 +157,24 @@ pub fn journal_freshness_evidence(journal_path: Option<&str>) -> (EvidenceSource
     }
 }
 
+/// 证据 3：journal JSONL 落盘行数 — pump 统计锚定不可伪造的落盘事实。
+///
+/// 借鉴：yologdev/yoyo-evolve — meta-suggestion evt-0028 用 file reads 替代
+/// 自报计数防自欺：pump 量必须从文件实际行数得出，cron/LLM 自报条目数
+/// 仅作交叉参考不作权威。空行与纯空白行不计入。
+pub fn journal_line_count_evidence(journal_path: Option<&str>) -> (EvidenceSource, Option<String>) {
+    let Some(path) = journal_path else {
+        return (EvidenceSource::Unconfigured, None);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let lines = content.lines().filter(|l| !l.trim().is_empty()).count();
+            (EvidenceSource::Measured, Some(lines.to_string()))
+        }
+        Err(_) => (EvidenceSource::Unavailable, None),
+    }
+}
+
 /// 汇总判定：status + verdict 一并输出，每个状态声明附测量依据。
 ///
 /// 判定词表驱动（见 `VerdictSpec` / `decide`）：build_report 不再内联裸字符串，
@@ -248,6 +266,54 @@ mod tests {
         let (src, raw) = journal_freshness_evidence(Some(file.to_str().unwrap()));
         assert_eq!(src, EvidenceSource::Measured);
         assert!(raw.unwrap().parse::<u64>().is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 证据 3：journal 落盘行数（yoyo evt-0028 file reads 防自欺）----
+
+    #[test]
+    fn test_journal_line_count_unconfigured_vs_unavailable() {
+        let (src, raw) = journal_line_count_evidence(None);
+        assert_eq!(src, EvidenceSource::Unconfigured);
+        assert!(raw.is_none());
+
+        let (src, raw) = journal_line_count_evidence(Some("/nonexistent/journal.jsonl"));
+        assert_eq!(src, EvidenceSource::Unavailable);
+        assert!(raw.is_none());
+    }
+
+    #[test]
+    fn test_journal_line_count_counts_disk_lines_not_reports() {
+        // pump 统计锚定落盘行数：3 条 JSON 行 + 1 空行 + 1 纯空白行 → 3
+        let dir = std::env::temp_dir().join(format!("qbody-health-lc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("journal.jsonl");
+        std::fs::write(&file, b"{\"a\":1}\n{\"b\":2}\n\n   \n{\"c\":3}\n").unwrap();
+
+        let (src, raw) = journal_line_count_evidence(Some(file.to_str().unwrap()));
+        assert_eq!(src, EvidenceSource::Measured);
+        assert_eq!(
+            raw.as_deref(),
+            Some("3"),
+            "空行/纯空白行不计入，只信落盘行数"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_journal_line_count_empty_file_is_zero_measured() {
+        // 空文件是 measured 0 行（泵确实没跳），不是 Unavailable——
+        // 「没写入」与「读不到」是两种事实，不得混同（SOUL §15 三态判据）
+        let dir = std::env::temp_dir().join(format!("qbody-health-lc0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("journal.jsonl");
+        std::fs::write(&file, b"").unwrap();
+
+        let (src, raw) = journal_line_count_evidence(Some(file.to_str().unwrap()));
+        assert_eq!(src, EvidenceSource::Measured);
+        assert_eq!(raw.as_deref(), Some("0"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
