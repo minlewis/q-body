@@ -21,6 +21,35 @@ pub const TAO_MAX_LINES: usize = 3000;
 /// journal 事件类型名
 pub const TRUST_INPUT_EVENT: &str = "trust_input";
 
+/// 事件归属：进化事件流必须带来源标注，杜绝子 agent 建议冒充主会话判断。
+/// 借鉴 yoyo-evolve Day210 Task 2「子 agent 文本不得读作主会话指令」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// 主会话自身的判断/注入
+    MainSession,
+    /// 子 agent 产生的建议/注入
+    SubAgent,
+}
+
+impl InputOrigin {
+    /// 落盘/日志用的稳定字符串形式
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InputOrigin::MainSession => "main_session",
+            InputOrigin::SubAgent => "sub_agent",
+        }
+    }
+
+    /// 从落盘字符串还原（未知值回落 MainSession 并返回 false 供调用方记日志）
+    pub fn from_str_lossy(s: &str) -> (Self, bool) {
+        match s {
+            "main_session" => (InputOrigin::MainSession, true),
+            "sub_agent" => (InputOrigin::SubAgent, true),
+            _ => (InputOrigin::MainSession, false),
+        }
+    }
+}
+
 /// FNV-1a 64-bit 指纹（确定性、无依赖；仅用于变更检测，非密码学用途）
 pub fn fnv1a64(data: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -56,15 +85,19 @@ pub struct TrustInputEvent {
     pub lines: usize,
     /// 是否在 TAO 行数预算内
     pub budget_ok: bool,
+    /// 事件归属（main_session / sub_agent）——进化事件流的信任边界标注
+    pub origin: InputOrigin,
 }
 
 /// gate 判定：hash 未变化 → None（无需落账）；
 /// 首次注入（prev 为空）或 hash 变化 → 构造事件（先落账再注入）。
+/// `origin` 随事件落盘，gate_audit 可按归属过滤子 agent 建议。
 pub fn audit_injection(
     name: &str,
     prev_hash: &str,
     content: &str,
     now_rfc3339: &str,
+    origin: InputOrigin,
 ) -> Option<TrustInputEvent> {
     let (new_hash, lines) = fingerprint(content);
     if new_hash == prev_hash {
@@ -77,6 +110,7 @@ pub fn audit_injection(
         new_hash,
         lines,
         budget_ok: within_budget(lines, TAO_MAX_LINES),
+        origin,
     })
 }
 
@@ -143,20 +177,27 @@ mod tests {
 
     #[test]
     fn test_first_injection_records_event_with_empty_prev() {
-        let ev = audit_injection("SOUL.md", "", "# soul\nline2", "2026-09-12T14:30:00Z")
-            .expect("first injection must record");
+        let ev = audit_injection(
+            "SOUL.md",
+            "",
+            "# soul\nline2",
+            "2026-09-12T14:30:00Z",
+            InputOrigin::MainSession,
+        )
+        .expect("first injection must record");
         assert_eq!(ev.name, "SOUL.md");
         assert_eq!(ev.prev_hash, "");
         assert_eq!(ev.new_hash, fnv1a64("# soul\nline2"));
         assert_eq!(ev.lines, 2);
         assert!(ev.budget_ok);
+        assert_eq!(ev.origin, InputOrigin::MainSession);
     }
 
     #[test]
     fn test_unchanged_content_returns_none() {
         let content = "# soul\nstable";
         let (hash, _) = fingerprint(content);
-        assert!(audit_injection("SOUL.md", &hash, content, "t").is_none());
+        assert!(audit_injection("SOUL.md", &hash, content, "t", InputOrigin::MainSession).is_none());
     }
 
     #[test]
@@ -164,7 +205,14 @@ mod tests {
         let old = "# soul v1";
         let (old_hash, _) = fingerprint(old);
         let new = "# soul v2 — silently tampered";
-        let ev = audit_injection("SOUL.md", &old_hash, new, "t2").expect("change must record");
+        let ev = audit_injection(
+            "SOUL.md",
+            &old_hash,
+            new,
+            "t2",
+            InputOrigin::MainSession,
+        )
+        .expect("change must record");
         assert_eq!(ev.prev_hash, old_hash);
         assert_eq!(ev.new_hash, fnv1a64(new));
     }
@@ -172,19 +220,60 @@ mod tests {
     #[test]
     fn test_over_budget_content_marks_budget_ok_false() {
         let big = "x\n".repeat(TAO_MAX_LINES + 1);
-        let ev =
-            audit_injection("SOUL.md", "", &big, "t").expect("first injection must record");
+        let ev = audit_injection(
+            "SOUL.md",
+            "",
+            &big,
+            "t",
+            InputOrigin::MainSession,
+        )
+        .expect("first injection must record");
         assert!(!ev.budget_ok);
         assert_eq!(ev.lines, TAO_MAX_LINES + 1);
+    }
+
+    #[test]
+    fn test_origin_roundtrip_strings() {
+        assert_eq!(InputOrigin::MainSession.as_str(), "main_session");
+        assert_eq!(InputOrigin::SubAgent.as_str(), "sub_agent");
+        let (o, ok) = InputOrigin::from_str_lossy("sub_agent");
+        assert_eq!(o, InputOrigin::SubAgent);
+        assert!(ok);
+        let (o, ok) = InputOrigin::from_str_lossy("main_session");
+        assert_eq!(o, InputOrigin::MainSession);
+        assert!(ok);
+        // 未知值：回落 main_session 并显式报 not-ok（调用方可记日志）
+        let (o, ok) = InputOrigin::from_str_lossy("something_new");
+        assert_eq!(o, InputOrigin::MainSession);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_sub_agent_event_keeps_origin_distinct() {
+        // 子 agent 注入与主会话注入同内容，事件 origin 必须可区分——
+        // 下游 gate_audit 按 origin 过滤时不会把子 agent 建议读作主会话判断
+        let content = "# suggestion from sub agent";
+        let main_ev =
+            audit_injection("skill:x", "", content, "t1", InputOrigin::MainSession).unwrap();
+        let sub_ev = audit_injection("skill:x", "", content, "t2", InputOrigin::SubAgent).unwrap();
+        assert_ne!(main_ev.origin, sub_ev.origin);
+        assert_eq!(sub_ev.origin.as_str(), "sub_agent");
     }
 
     #[tokio::test]
     async fn test_journal_roundtrip() {
         let journal = TrustInputJournal::new();
         assert!(journal.events().await.is_empty());
-        let ev = audit_injection("SOUL.md", "", "content", "t1").unwrap();
+        let ev = audit_injection("SOUL.md", "", "content", "t1", InputOrigin::MainSession).unwrap();
         journal.record(ev.clone()).await;
-        let ev2 = audit_injection("SOUL.md", &ev.new_hash, "changed", "t2").unwrap();
+        let ev2 = audit_injection(
+            "SOUL.md",
+            &ev.new_hash,
+            "changed",
+            "t2",
+            InputOrigin::SubAgent,
+        )
+        .unwrap();
         journal.record(ev2.clone()).await;
         let all = journal.events().await;
         assert_eq!(all.len(), 2);
@@ -192,5 +281,8 @@ mod tests {
         assert_eq!(all[1], ev2);
         // 时间线可回放：第二次的 prev_hash == 第一次的 new_hash
         assert_eq!(all[1].prev_hash, all[0].new_hash);
+        // 归属随事件保留：主会话在前、子 agent 在后，不混淆
+        assert_eq!(all[0].origin, InputOrigin::MainSession);
+        assert_eq!(all[1].origin, InputOrigin::SubAgent);
     }
 }
