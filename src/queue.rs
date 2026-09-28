@@ -102,12 +102,7 @@ mod tests {
     #[test]
     fn test_error_summary_is_truncated() {
         let long_err = "x".repeat(200);
-        let event = LlmParseEvent::record(
-            LlmFailureKind::JsonParse,
-            None,
-            0,
-            &long_err,
-        );
+        let event = LlmParseEvent::record(LlmFailureKind::JsonParse, None, 0, &long_err);
         assert!(event.error_summary.len() <= 80);
         assert!(event.error_summary.ends_with("..."));
     }
@@ -115,12 +110,7 @@ mod tests {
     #[test]
     fn test_short_error_untouched() {
         let short = "expected value at line 1 column 1";
-        let event = LlmParseEvent::record(
-            LlmFailureKind::JsonParse,
-            None,
-            0,
-            short,
-        );
+        let event = LlmParseEvent::record(LlmFailureKind::JsonParse, None, 0, short);
         assert_eq!(event.error_summary, short);
     }
 

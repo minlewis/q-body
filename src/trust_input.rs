@@ -197,7 +197,9 @@ mod tests {
     fn test_unchanged_content_returns_none() {
         let content = "# soul\nstable";
         let (hash, _) = fingerprint(content);
-        assert!(audit_injection("SOUL.md", &hash, content, "t", InputOrigin::MainSession).is_none());
+        assert!(
+            audit_injection("SOUL.md", &hash, content, "t", InputOrigin::MainSession).is_none()
+        );
     }
 
     #[test]
@@ -205,14 +207,8 @@ mod tests {
         let old = "# soul v1";
         let (old_hash, _) = fingerprint(old);
         let new = "# soul v2 — silently tampered";
-        let ev = audit_injection(
-            "SOUL.md",
-            &old_hash,
-            new,
-            "t2",
-            InputOrigin::MainSession,
-        )
-        .expect("change must record");
+        let ev = audit_injection("SOUL.md", &old_hash, new, "t2", InputOrigin::MainSession)
+            .expect("change must record");
         assert_eq!(ev.prev_hash, old_hash);
         assert_eq!(ev.new_hash, fnv1a64(new));
     }
@@ -220,14 +216,8 @@ mod tests {
     #[test]
     fn test_over_budget_content_marks_budget_ok_false() {
         let big = "x\n".repeat(TAO_MAX_LINES + 1);
-        let ev = audit_injection(
-            "SOUL.md",
-            "",
-            &big,
-            "t",
-            InputOrigin::MainSession,
-        )
-        .expect("first injection must record");
+        let ev = audit_injection("SOUL.md", "", &big, "t", InputOrigin::MainSession)
+            .expect("first injection must record");
         assert!(!ev.budget_ok);
         assert_eq!(ev.lines, TAO_MAX_LINES + 1);
     }

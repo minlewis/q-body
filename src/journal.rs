@@ -1324,7 +1324,9 @@ mod tests {
 
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let path = format!("/tmp/test_journal_skip_{}.jsonl", timestamp);
-        journal.persist_to_jsonl(&path).expect("persist should succeed");
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
 
         let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
         assert_eq!(loaded.total_skips(), 2);
@@ -1347,12 +1349,13 @@ mod tests {
 
         let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
         assert_eq!(loaded.total_events(), 0);
-        assert_eq!(loaded.total_skips(), 1, "未识别行应聚合为一条 load_jsonl skip 事件");
-        assert_eq!(loaded.skips()[0].gate, "load_jsonl");
         assert_eq!(
-            loaded.skips()[0].reason,
-            "unrecognized_line_count=2"
+            loaded.total_skips(),
+            1,
+            "未识别行应聚合为一条 load_jsonl skip 事件"
         );
+        assert_eq!(loaded.skips()[0].gate, "load_jsonl");
+        assert_eq!(loaded.skips()[0].reason, "unrecognized_line_count=2");
 
         let _ = std::fs::remove_file(&path);
     }

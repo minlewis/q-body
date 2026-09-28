@@ -136,7 +136,7 @@ impl QBodyHandler {
                     request_id,
                     "signal must be one of: refactor|dedup|test|perf|bump",
                 ))
-                .unwrap()
+                .unwrap();
             }
         };
         let source = p
@@ -149,10 +149,7 @@ impl QBodyHandler {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
-        let action = p
-            .get("action")
-            .and_then(|s| s.as_str())
-            .map(String::from);
+        let action = p.get("action").and_then(|s| s.as_str()).map(String::from);
         let verification = p
             .get("verification")
             .and_then(|s| s.as_str())
@@ -160,9 +157,7 @@ impl QBodyHandler {
 
         let mut journal = self.journal.write().await;
         match (action, verification) {
-            (Some(a), Some(v)) => {
-                journal.record_loop(signal.clone(), source, suggestion, a, v)
-            }
+            (Some(a), Some(v)) => journal.record_loop(signal.clone(), source, suggestion, a, v),
             _ => journal.record(signal.clone(), source, suggestion),
         }
 
@@ -396,10 +391,7 @@ impl QBodyHandler {
                         provider.name,
                         provider.api_key_env
                     );
-                    last_err = Some(format!(
-                        "LLM provider {} not configured",
-                        provider.name
-                    ));
+                    last_err = Some(format!("LLM provider {} not configured", provider.name));
                     continue;
                 }
             };
@@ -437,9 +429,8 @@ impl QBodyHandler {
                                 self.maybe_cost_warn(source, usage, text.len()).await;
                                 return text;
                             }
-                            let err_msg = body["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
+                            let err_msg =
+                                body["error"]["message"].as_str().unwrap_or("unknown error");
 
                             let full_err = format!(
                                 "LLM API error on {} ({}): {} — failing over",
@@ -455,10 +446,8 @@ impl QBodyHandler {
                             );
 
                             tracing::error!("{}", full_err);
-                            last_err = Some(format!(
-                                "Sorry, LLM returned error {}: {}",
-                                status, err_msg
-                            ));
+                            last_err =
+                                Some(format!("Sorry, LLM returned error {}: {}", status, err_msg));
                             // 5xx/限流 → failover；4xx 是请求自身问题也换 provider 试一次，
                             // 由末端统一兜底（与 freellmapi 的宽松 failover 语义一致）
                         }
@@ -477,10 +466,7 @@ impl QBodyHandler {
                             );
 
                             tracing::error!("{}", full_err);
-                            last_err = Some(format!(
-                                "Sorry, failed to parse LLM response: {}",
-                                e
-                            ));
+                            last_err = Some(format!("Sorry, failed to parse LLM response: {}", e));
                         }
                     }
                 }
@@ -504,8 +490,7 @@ impl QBodyHandler {
             }
         }
 
-        let msg = last_err
-            .unwrap_or_else(|| "LLM provider chain is empty".to_string());
+        let msg = last_err.unwrap_or_else(|| "LLM provider chain is empty".to_string());
         Self::sanitize_err_reply(&msg)
     }
 
@@ -633,7 +618,11 @@ mod failover_tests {
     #[test]
     fn test_chain_urls_are_https() {
         for p in LLM_PROVIDERS {
-            assert!(p.api_url.starts_with("https://"), "{} must be https", p.name);
+            assert!(
+                p.api_url.starts_with("https://"),
+                "{} must be https",
+                p.name
+            );
         }
     }
 

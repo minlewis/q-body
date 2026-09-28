@@ -81,7 +81,10 @@ pub fn input_price_usd_per_mtok() -> f64 {
 
 /// output 单价（美元 / 1M tokens），env `QBODY_COST_OUTPUT_USD_PER_MTOK` 可覆盖
 pub fn output_price_usd_per_mtok() -> f64 {
-    price_per_mtok("QBODY_COST_OUTPUT_USD_PER_MTOK", DEFAULT_OUTPUT_USD_PER_MTOK)
+    price_per_mtok(
+        "QBODY_COST_OUTPUT_USD_PER_MTOK",
+        DEFAULT_OUTPUT_USD_PER_MTOK,
+    )
 }
 
 /// 由 usage tokens 估算单次调用成本（美元）。
