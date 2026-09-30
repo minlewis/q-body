@@ -163,12 +163,24 @@ impl QBodyHandler {
 
         // 原子落盘（QBODY_JOURNAL_PATH 未配置则跳过，journal 只在内存）
         // persisted 判定用写后回读自验：写成功 + 回读可解析且内容一致才算 true
-        let persisted = if let Ok(path) = std::env::var("QBODY_JOURNAL_PATH") {
-            journal.persist_verified_to_jsonl(&path).unwrap_or(false)
+        let mut persisted = false;
+        let mut artifact_evidence: Option<serde_json::Value> = None;
+        if let Ok(path) = std::env::var("QBODY_JOURNAL_PATH") {
+            persisted = journal.persist_verified_to_jsonl(&path).unwrap_or(false);
+            drop(journal);
+            // executed-artifact 回查（借鉴 yoyo-evolve Day 214）：persisted: true
+            // 不够——还要回读产物文件本体，确认它真实存在且非空可解析，
+            // 堵住「写入路径报成功但记录缺失」类假成功（exit 0 ≠ 记录存在）。
+            let check = crate::artifact::check_artifact(&path, 1);
+            persisted = persisted && check.verdict == crate::artifact::ArtifactVerdict::Present;
+            artifact_evidence = Some(serde_json::json!({
+                "path": check.path,
+                "verdict": check.verdict.as_str(),
+                "line_count": check.line_count,
+            }));
         } else {
-            false
-        };
-        drop(journal);
+            drop(journal);
+        }
 
         serde_json::to_value(JsonRpcResponse::success(
             request_id,
@@ -176,6 +188,7 @@ impl QBodyHandler {
                 "recorded": true,
                 "signal": format!("{:?}", signal).to_lowercase(),
                 "persisted": persisted,
+                "artifact": artifact_evidence,
             }),
         ))
         .unwrap()
