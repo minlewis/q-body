@@ -215,6 +215,42 @@ impl GetTaskResponse {
 }
 
 // ============================================================
+// Transport scope — 方法表的通道归属（REPL-only 动词形态门）
+// ============================================================
+
+/// JSON-RPC 方法的 transport scope：A2A 方法对外开放，internal 方法只限内部任务通道
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportScope {
+    /// 可经任何通道（含 A2A JSON-RPC 端点）调用
+    A2a,
+    /// 仅限内部任务通道调用；经 A2A 端点请求时分发前拒绝
+    Internal,
+}
+
+impl TransportScope {
+    /// 方法名（含别名归一化，"SendMessage"/"message/send" 同 scope）到 scope 的映射。
+    /// 单一事实源：handle_request 的分发表必须与本表对齐。
+    pub fn for_method(method: &str) -> Option<Self> {
+        match method.trim() {
+            "SendMessage" | "message/send" | "GetTask" | "tasks/get" | "ListTasks"
+            | "tasks/list" => Some(Self::A2a),
+            "Reflect" | "reflection/score" | "JournalRecord" | "journal/record" => {
+                Some(Self::Internal)
+            }
+            _ => None,
+        }
+    }
+
+    /// 非 A2A 方法经 A2A 通道调用的结构化拒绝理由
+    pub fn rejection_message(method: &str) -> String {
+        format!(
+            "Method '{method}' is internal-only (transport scope: internal); \
+             not callable via the A2A JSON-RPC endpoint"
+        )
+    }
+}
+
+// ============================================================
 // JSON-RPC 协议层
 // ============================================================
 

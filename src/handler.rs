@@ -90,6 +90,15 @@ impl QBodyHandler {
         params: Option<serde_json::Value>,
         request_id: serde_json::Value,
     ) -> serde_json::Value {
+        // transport scope 门：internal 方法经 A2A 通道调用时分发前拒绝（结构化错误）
+        if TransportScope::for_method(method) == Some(TransportScope::Internal) {
+            return serde_json::to_value(JsonRpcError::invalid_params(
+                request_id,
+                &TransportScope::rejection_message(method),
+            ))
+            .unwrap();
+        }
+
         match method {
             "SendMessage" | "message/send" => self.handle_send_message(params, request_id).await,
             "GetTask" | "tasks/get" => self.handle_get_task(params, request_id).await,
@@ -653,6 +662,130 @@ mod failover_tests {
         for p in LLM_PROVIDERS {
             assert!(!p.model.is_empty());
             assert!(!p.api_url.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_scope_tests {
+    use super::*;
+    use crate::a2a::types::{TransportScope, TransportScope::*};
+
+    #[test]
+    fn test_scope_table_covers_full_dispatch_table() {
+        // 单一事实源对齐：handle_request 分发表里每个方法都必须有 scope 归属
+        for m in [
+            "SendMessage",
+            "message/send",
+            "GetTask",
+            "tasks/get",
+            "ListTasks",
+            "tasks/list",
+            "Reflect",
+            "reflection/score",
+            "JournalRecord",
+            "journal/record",
+        ] {
+            assert!(TransportScope::for_method(m).is_some(), "{m} unmapped");
+        }
+    }
+
+    #[test]
+    fn test_a2a_verbs_are_a2a_scope() {
+        for m in ["SendMessage", "message/send", "GetTask", "tasks/get"] {
+            assert_eq!(TransportScope::for_method(m), Some(A2a), "{m}");
+        }
+    }
+
+    #[test]
+    fn test_internal_verbs_are_internal_scope() {
+        for m in [
+            "Reflect",
+            "reflection/score",
+            "JournalRecord",
+            "journal/record",
+        ] {
+            assert_eq!(TransportScope::for_method(m), Some(Internal), "{m}");
+        }
+    }
+
+    #[test]
+    fn test_unknown_method_has_no_scope() {
+        assert_eq!(TransportScope::for_method("Nope"), None);
+        assert_eq!(TransportScope::for_method("  "), None);
+    }
+
+    #[test]
+    fn test_unknown_method_still_reaches_method_not_found() {
+        // 未知方法不走 scope 门，保持 JSON-RPC method_not_found 语义
+        let h = QBodyHandler::new(
+            TaskStore::new(),
+            crate::a2a::types::AgentCard {
+                name: "t".into(),
+                description: String::new(),
+                url: None,
+                provider: None,
+                version: "0".into(),
+                capabilities: None,
+                default_input_modes: vec![],
+                default_output_modes: vec![],
+                skills: vec![],
+                supported_interfaces: vec![],
+            },
+        );
+        let out = tokio_test_block(h.handle_request("Nope", None, serde_json::json!(1)));
+        assert!(out["error"]["code"].as_i64() == Some(-32601), "{out}");
+    }
+
+    #[test]
+    fn test_internal_method_rejected_before_dispatch() {
+        // golden：internal 方法经 A2A 通道调用，分发前结构化拒绝，handler 本体不触达
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        for m in ["JournalRecord", "journal/record", "Reflect", "reflection/score"] {
+            let out = tokio_test_block(h.handle_request(
+                m,
+                Some(serde_json::json!({"signal": "test", "source": "x", "suggestion": "y"})),
+                serde_json::json!(7),
+            ));
+            assert_eq!(out["error"]["code"].as_i64(), Some(-32602), "{m}: {out}");
+            let msg = out["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("internal-only") && msg.contains(m),
+                "{m}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a2a_send_message_still_dispatches() {
+        // 正路径：A2A 方法不被 scope 门拦截（进入正常 params 校验，非 scope 拒绝）
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = tokio_test_block(h.handle_request("SendMessage", None, serde_json::json!(1)));
+        let msg = out["error"]["message"].as_str().unwrap_or_default();
+        assert!(!msg.contains("internal-only"), "scope gate leaked: {out}");
+    }
+
+    /// 单线程阻塞执行 async handler（测试内无 tokio runtime）
+    fn tokio_test_block<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
+
+    fn test_agent_card() -> crate::a2a::types::AgentCard {
+        crate::a2a::types::AgentCard {
+            name: "t".into(),
+            description: String::new(),
+            url: None,
+            provider: None,
+            version: "0".into(),
+            capabilities: None,
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            supported_interfaces: vec![],
         }
     }
 }
