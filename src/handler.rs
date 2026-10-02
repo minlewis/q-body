@@ -123,18 +123,17 @@ impl QBodyHandler {
         let signal = match p
             .get("signal")
             .and_then(|s| s.as_str())
-            .map(|s| s.to_lowercase())
-            .as_deref()
+            .and_then(crate::journal::EvolutionSignal::from_vocab)
         {
-            Some("refactor") => crate::journal::EvolutionSignal::Refactor,
-            Some("dedup") => crate::journal::EvolutionSignal::Dedup,
-            Some("test") => crate::journal::EvolutionSignal::Test,
-            Some("perf") => crate::journal::EvolutionSignal::Perf,
-            Some("bump") => crate::journal::EvolutionSignal::Bump,
-            _ => {
+            Some(sig) => sig,
+            None => {
                 return serde_json::to_value(JsonRpcError::invalid_params(
                     request_id,
-                    "signal must be one of: refactor|dedup|test|perf|bump",
+                    // 词表文案单一事实源：与 EVOLUTION_SIGNALS 词表一起演进
+                    &format!(
+                        "signal must be one of: {}",
+                        crate::journal::EvolutionSignal::vocab_hint()
+                    ),
                 ))
                 .unwrap();
             }
