@@ -617,6 +617,50 @@ impl Journal {
         })
     }
 
+    /// Resume-strict gate：处理任务前的 journal 一致性校验（#979 `--continue-strict` 同款）。
+    ///
+    /// 借鉴来源：yologdev/yoyo-evolve — #979 `--continue-strict`：resume 前先校验
+    /// 状态可读且自洽，失败在任何 LLM 调用之前返回错误，绝不带病续跑。
+    ///
+    /// 校验语义（宁可误报不可漏报）：
+    /// - 文件不存在 = 空白状态，视为可 resume（`Ok(())`）；
+    /// - 文件不可读 / 末行 JSON 不可解析 / 结构行数与内容行数矛盾 = 损坏，返回 `Err`；
+    /// - `unrecognized` 静默跳过行 > 0 = 部分损坏，同样拒绝 resume。
+    pub fn verify_resume_strict(path: &str) -> Result<(), String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("journal unreadable: {e}")),
+        };
+
+        // 结构行（meta）与内容行（三类条目）都必须可解析为 JSON；
+        // 任一整行 parse 失败即视为损坏（区别于 load 的静默 skip 语义）。
+        let mut unrecognized = 0usize;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<serde_json::Value>(line).is_err() {
+                unrecognized += 1;
+            }
+        }
+        if unrecognized > 0 {
+            return Err(format!(
+                "journal corrupt: {unrecognized} unparseable line(s) — refusing strict resume"
+            ));
+        }
+
+        // 末行存在但为空 / 全空白 = 写入中断的典型残迹，同样拒绝。
+        if let Some(last) = content.lines().next_back() {
+            if last.trim().is_empty() {
+                return Err("journal corrupt: trailing blank line (interrupted write?)".into());
+            }
+        }
+
+        Ok(())
+    }
+
     /// SOUL 注入切片：从 events 尾部（最新优先）按字符预算取条目，勿全量。
     ///
     /// 借鉴来源：yologdev/yoyo-evolve — #886 arg-gated 分档（查询/注入类
@@ -1376,6 +1420,74 @@ mod tests {
         assert_eq!(loaded.total_assessments(), 0);
         assert_eq!(loaded.seen_count(), 0);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- resume-strict gate（#979 `--continue-strict` 同款）----
+
+    #[test]
+    fn test_resume_strict_missing_file_is_ok() {
+        let path = "/tmp/test_resume_strict_missing_does_not_exist.jsonl";
+        let _ = std::fs::remove_file(path);
+        assert!(
+            Journal::verify_resume_strict(path).is_ok(),
+            "文件不存在 = 空白状态，应放行"
+        );
+    }
+
+    #[test]
+    fn test_resume_strict_clean_journal_passes() {
+        let mut journal = Journal::new();
+        journal.record(EvolutionSignal::Test, "src".into(), "suggestion".into());
+        journal.record_skip("probe", "already_running");
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_resume_strict_clean_{}.jsonl", timestamp);
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
+        assert!(
+            Journal::verify_resume_strict(&path).is_ok(),
+            "完整落盘的 journal 应通过 strict gate"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_resume_strict_rejects_garbage_lines() {
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_resume_strict_garbage_{}.jsonl", timestamp);
+        std::fs::write(&path, "{\"ok\":true}\nnot json at all\n").expect("write garbage file");
+        let err =
+            Journal::verify_resume_strict(&path).expect_err("不可解析行必须拒绝 strict resume");
+        assert!(err.contains("unparseable"), "错误信息应点明损坏原因：{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_resume_strict_rejects_truncated_trailing_line() {
+        // 模拟写入中断：最后一行 JSON 被截断（非完整 JSON = unparseable）
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_resume_strict_trunc_{}.jsonl", timestamp);
+        std::fs::write(&path, "{\"type\":\"__journal_meta__\"}\n{\"signal\":\"Te")
+            .expect("write truncated file");
+        assert!(
+            Journal::verify_resume_strict(&path).is_err(),
+            "截断的末行（写入中断残迹）必须拒绝 strict resume"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_resume_strict_rejects_trailing_blank_line() {
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_resume_strict_blank_{}.jsonl", timestamp);
+        std::fs::write(&path, "{\"ok\":true}\n   \n").expect("write blank-tail file");
+        let err = Journal::verify_resume_strict(&path)
+            .expect_err("末行空白（写入中断残迹）必须拒绝 strict resume");
+        assert!(
+            err.contains("trailing blank"),
+            "错误信息应点明损坏原因：{err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
