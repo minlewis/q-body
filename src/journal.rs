@@ -30,6 +30,48 @@ pub enum EvolutionSignal {
     Bump,
 }
 
+/// signal 闭集词表 — 单一事实源（issue #128）。
+///
+/// JournalRecord 处理器自有闭集：handler 解析分支与用户可见错误文案
+/// 都从这两个常量派生，新增信号只改枚举 + 此处词表，golden 测试钉住。
+pub const EVOLUTION_SIGNALS: [EvolutionSignal; 5] = [
+    EvolutionSignal::Refactor,
+    EvolutionSignal::Dedup,
+    EvolutionSignal::Test,
+    EvolutionSignal::Perf,
+    EvolutionSignal::Bump,
+];
+
+impl EvolutionSignal {
+    /// 词表内的规范小写拼写（与 JSONL 序列化 / API 词一致）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvolutionSignal::Refactor => "refactor",
+            EvolutionSignal::Dedup => "dedup",
+            EvolutionSignal::Test => "test",
+            EvolutionSignal::Perf => "perf",
+            EvolutionSignal::Bump => "bump",
+        }
+    }
+
+    /// 用户可见词表文案（handler invalid_params 错误消息单一来源）
+    pub fn vocab_hint() -> String {
+        EVOLUTION_SIGNALS
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// 按词表解析入站 signal 字符串（大小写不敏感，同 handler 现行为）
+    pub fn from_vocab(raw: &str) -> Option<EvolutionSignal> {
+        EVOLUTION_SIGNALS
+            .iter()
+            .find(|s| s.as_str() == raw.to_lowercase())
+            .cloned()
+    }
+}
+
 /// 进化闭环阶段 — 养料回灌四阶段
 ///
 /// 对应每日养料回灌的完整生命周期：养料从哪来 → 建议怎么改 → 实际改了什么 → 是否验证通过。
@@ -660,6 +702,74 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- golden：signal 闭集词表字节级钉死（issue #128，yoyo#936 同款）----
+
+    #[test]
+    fn golden_signal_vocab_hint_bytes() {
+        // 词表文案字节级断言：改词表必先改这条测试
+        assert_eq!(
+            EvolutionSignal::vocab_hint(),
+            "refactor|dedup|test|perf|bump"
+        );
+    }
+
+    #[test]
+    fn golden_signal_vocab_closed_set_roundtrip() {
+        // 闭集内逐词 round-trip：as_str ↔ from_vocab 一一对应
+        for (i, sig) in EVOLUTION_SIGNALS.iter().enumerate() {
+            let word = sig.as_str();
+            let back = EvolutionSignal::from_vocab(word)
+                .unwrap_or_else(|| panic!("词表词 {word:?} 解析失败"));
+            assert_eq!(&back, sig, "词表第 {i} 词 round-trip 失败");
+        }
+    }
+
+    #[test]
+    fn test_signal_vocab_rejects_out_of_band() {
+        // 闭集外拒绝（含大小写不敏感 + prose 误燃不通过）
+        assert_eq!(
+            EvolutionSignal::from_vocab("REFACTOR"),
+            Some(EvolutionSignal::Refactor)
+        );
+        assert_eq!(EvolutionSignal::from_vocab(""), None);
+        assert_eq!(EvolutionSignal::from_vocab("unknown"), None);
+        assert_eq!(EvolutionSignal::from_vocab("refactor|dedup"), None);
+        assert_eq!(EvolutionSignal::from_vocab("signal must be refactor"), None);
+    }
+
+    #[test]
+    fn test_signal_vocab_pins_both_spelling_layers() {
+        // 两层拼写分别钉死（golden 钉现状，usage.rs 判例）：
+        // ① API 词表层（handler 入参 / 错误文案）= 小写 as_str()
+        // ② JSONL serde 层 = PascalCase 变体名（既有 journal 兼容，不得擅改）
+        // 若未来统一两层拼写，必须同步迁移存量 journal 数据并改本测试。
+        assert_eq!(
+            serde_json::to_string(&EvolutionSignal::Refactor).unwrap(),
+            "\"Refactor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvolutionSignal::Dedup).unwrap(),
+            "\"Dedup\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvolutionSignal::Test).unwrap(),
+            "\"Test\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvolutionSignal::Perf).unwrap(),
+            "\"Perf\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvolutionSignal::Bump).unwrap(),
+            "\"Bump\""
+        );
+        assert_eq!(EvolutionSignal::Refactor.as_str(), "refactor");
+        assert_eq!(
+            EvolutionSignal::vocab_hint(),
+            "refactor|dedup|test|perf|bump"
+        );
+    }
 
     #[test]
     fn test_soul_slice_empty_journal_returns_empty() {
