@@ -194,8 +194,15 @@ async fn main() {
     let handler = QBodyHandler::new(task_store, agent_card);
 
     // Journal 启动加载：QBODY_JOURNAL_PATH 存在则 load（记忆泵接上心跳），
-    // 缺省不落盘 —— 探针 Unconfigured 语义保持向后兼容
+    // 缺省不落盘 —— 探针 Unconfigured 语义保持向后兼容。
+    // Resume-strict gate：journal 可读性校验在任何请求处理之前执行——
+    // 损坏即退出报错，绝不静默降级为空 journal 带病续跑。
     if let Ok(p) = std::env::var("QBODY_JOURNAL_PATH") {
+        if let Err(reason) = journal::Journal::verify_resume_strict(&p) {
+            tracing::error!("resume-strict gate: {reason}");
+            eprintln!("resume-strict gate: {reason}");
+            std::process::exit(1);
+        }
         let j = journal::Journal::load_from_jsonl(&p).unwrap_or_default();
         *handler.journal.write().await = j;
         tracing::info!("journal loaded from {}", p);
