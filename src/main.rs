@@ -145,16 +145,22 @@ async fn main() {
         )
         .init();
 
-    // 解析命令行参数
-    let mut port: u16 = 41242;
-    for arg in std::env::args().skip(1) {
-        if let Some(p) = arg.strip_prefix("--port=") {
-            if let Ok(n) = p.parse() {
-                port = n;
-            }
-        } else if arg == "--port" {
-            // handled by next arg, but we don't parse pairs here — too simple
-        }
+    // 结构化分类（#982 同款）：未知/非法参数不再静默吞掉——每次出现都产生
+    // 分类条目，Unknown/InvalidValue 类错误直接非零退出并打结构化 error body
+    // （golden 字节级钉死），杜绝「非法输入静默回退默认端口」的自 concealing。
+    let arg_strings: Vec<String> = std::env::args().skip(1).collect();
+    let (port, outcomes) = usage::resolve_port(&arg_strings);
+    if outcomes
+        .iter()
+        .any(|o| !matches!(o, usage::PortOutcome::Parsed(_)))
+    {
+        let err = usage::cli_error(&arg_strings, &outcomes);
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&err)
+                .unwrap_or_else(|_| format!("{{\"error\":\"{}\",\"exit_code\":2}}", err.error))
+        );
+        std::process::exit(err.exit_code);
     }
 
     // 构建 Agent Card
