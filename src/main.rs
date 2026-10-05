@@ -207,7 +207,12 @@ async fn main() {
         if let Err(reason) = journal::Journal::verify_resume_strict(&p) {
             tracing::error!("resume-strict gate: {reason}");
             eprintln!("resume-strict gate: {reason}");
-            std::process::exit(1);
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&usage::missing_resource_error(&reason))
+                    .unwrap_or_else(|_| "{\"error\":\"missing or unusable resource\",\"exit_code\":1}".into())
+            );
+            std::process::exit(usage::EXIT_MISSING_RESOURCE);
         }
         let j = journal::Journal::load_from_jsonl(&p).unwrap_or_default();
         *handler.journal.write().await = j;
@@ -248,7 +253,12 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("Failed to bind to {addr}: {e}");
-            std::process::exit(1);
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&usage::internal_error(&format!("bind {addr}: {e}")))
+                    .unwrap_or_else(|_| "{\"error\":\"internal error\",\"exit_code\":70}".into())
+            );
+            std::process::exit(usage::EXIT_INTERNAL);
         }
     };
 
@@ -268,13 +278,23 @@ async fn main() {
                 }
                 _ => {
                     tracing::error!("Unexpected IO error during serve: {io_err}");
-                    std::process::exit(1);
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(&usage::internal_error(&io_err.to_string()))
+                            .unwrap_or_else(|_| "{\"error\":\"internal error\",\"exit_code\":70}".into())
+                    );
+                    std::process::exit(usage::EXIT_INTERNAL);
                 }
             }
         } else {
             // 非 IO 错误（如 hyper 内部错误）— 仍应 panic 报告
             tracing::error!("Server error during serve: {e}");
-            std::process::exit(1);
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&usage::internal_error(&e.to_string()))
+                    .unwrap_or_else(|_| "{\"error\":\"internal error\",\"exit_code\":70}".into())
+            );
+            std::process::exit(usage::EXIT_INTERNAL);
         }
     }
 }

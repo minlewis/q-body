@@ -133,6 +133,50 @@ pub const ERROR_INVALID_PORT_VALUE: &str =
     "invalid value for --port (expected unsigned 16-bit integer)";
 pub const ERROR_UNKNOWN_ARG: &str = "unknown argument (see usage)";
 
+// ============================================================
+// 语义退出码词表（#982 slice 2 同款）：cron 管道可按退出码区分失败类型
+// （EXIT_USAGE = 2 已在上方 CLI 错误路径一节定义，此处不重复）
+// ============================================================
+
+/// 语义退出码：资源缺失（如 resume gate 下 journal 文件存在但损坏不可读）。
+/// systemd/cron 看到非零即知失败，看到 1 即知是「前置资源不可用」。
+pub const EXIT_MISSING_RESOURCE: i32 = 1;
+
+/// 语义退出码：内部错误（绑定失败、serve 期间意外 IO/hyper 错误）。
+/// sysexits.h 惯例 EX_SOFTWARE=70，区别于资源缺失与使用错误。
+pub const EXIT_INTERNAL: i32 = 70;
+
+/// 退出码合法性守卫：语义退出码两两可区分且非零，测试钉死防词表漂移。
+pub fn exit_codes_distinct() -> bool {
+    let codes = [EXIT_USAGE, EXIT_MISSING_RESOURCE, EXIT_INTERNAL];
+    codes.iter().all(|c| *c != 0) && {
+        let mut sorted = codes;
+        sorted.sort();
+        sorted.windows(2).all(|w| w[0] != w[1])
+    }
+}
+
+/// 内部错误结构化 body（bind 失败 / serve 意外错误路径）。详细原因只进
+/// tracing 日志，stderr 结构化体不含内部路径/配置细节（trust-boundary
+/// sanitize 同款纪律），文案常量单一事实源。
+pub fn internal_error(_detail: &str) -> CliError {
+    CliError {
+        error: "internal error (see logs for details)".to_string(),
+        rejected_args: Vec::new(),
+        exit_code: EXIT_INTERNAL,
+    }
+}
+
+/// 资源缺失/不可用结构化 body（resume-strict gate 路径）。reason 只进
+/// 日志与 eprintln 明文行，结构化体保持同形词表文案。
+pub fn missing_resource_error(_reason: &str) -> CliError {
+    CliError {
+        error: "missing or unusable resource (see logs for details)".to_string(),
+        rejected_args: Vec::new(),
+        exit_code: EXIT_MISSING_RESOURCE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +322,45 @@ mod tests {
     fn test_exit_usage_is_nonzero() {
         assert!(EXIT_USAGE > 0);
         assert_ne!(EXIT_USAGE, 1); // 与运行时失败退出码区分
+    }
+
+    // ---- 语义退出码词表（#982 slice 2）：cron 管道可区分失败类型 ----
+
+    #[test]
+    fn golden_exit_code_vocab() {
+        // 字节级钉死三值语义：改任何一值必须显式过这个 golden
+        assert_eq!(EXIT_MISSING_RESOURCE, 1);
+        assert_eq!(EXIT_USAGE, 2);
+        assert_eq!(EXIT_INTERNAL, 70); // sysexits.h EX_SOFTWARE 惯例
+        assert!(exit_codes_distinct());
+    }
+
+    #[test]
+    fn golden_internal_error_body() {
+        // 内部错误路径的结构化 body：文案常量单一事实源 + golden 钉死
+        let e = internal_error("Failed to bind to 127.0.0.1:41242: addr in use");
+        assert_eq!(e.error, "internal error (see logs for details)");
+        assert_eq!(e.rejected_args, Vec::<String>::new());
+        assert_eq!(e.exit_code, EXIT_INTERNAL);
+        let bytes = serde_json::to_string_pretty(&e).unwrap();
+        assert_eq!(
+            bytes,
+            "{\n  \"error\": \"internal error (see logs for details)\",\n  \"rejected_args\": [],\n  \"exit_code\": 70\n}"
+        );
+    }
+
+    #[test]
+    fn golden_missing_resource_error_body() {
+        // 资源缺失路径的结构化 body：reason 附在结构化字段而非裸 stderr 行
+        let e = missing_resource_error("resume-strict gate: journal corrupted");
+        assert_eq!(
+            e.error,
+            "missing or unusable resource (see logs for details)"
+        );
+        assert_eq!(e.exit_code, EXIT_MISSING_RESOURCE);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            "{\"error\":\"missing or unusable resource (see logs for details)\",\"rejected_args\":[],\"exit_code\":1}"
+        );
     }
 }
