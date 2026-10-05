@@ -7,6 +7,8 @@
 //! 子命令扩展。本模块把「输入 → 解析结果 + 面向用户的文案」做成词表驱动，
 //! 文案字符串集中单一事实源，golden tests 断言语义，宿主接线一行。
 
+use serde::Serialize;
+
 /// 单条 usage 语义表项：识别词 + 解析语义 + 用户可见文案。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageEntry {
@@ -82,6 +84,54 @@ pub fn usage_text() -> String {
     }
     lines.join("\n")
 }
+
+// ============================================================
+// CLI 错误路径：结构化 error body + 非零退出码（#982 slice 1 同款）
+// ============================================================
+
+/// 非法参数时的非零退出码。2 = 使用错误（区别于运行时失败的 1）。
+pub const EXIT_USAGE: i32 = 2;
+
+/// 结构化 CLI 错误体（serde 序列化到 stderr，golden 字节级钉死）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CliError {
+    pub error: String,
+    /// 按出现顺序列出被拒的原始参数（不重排，保持证据原样）
+    pub rejected_args: Vec<String>,
+    pub exit_code: i32,
+}
+
+/// 把参数分类结果折叠成结构化错误：任何 Unknown/InvalidValue 即错误体，
+/// 文案全部派生自本模块常量（单一事实源），render 处不做字符串拼接。
+pub fn cli_error(_args: &[String], outcomes: &[PortOutcome]) -> CliError {
+    let mut rejected = Vec::new();
+    let mut invalid_value = false;
+    for o in outcomes {
+        match o {
+            PortOutcome::InvalidValue(v) => {
+                rejected.push(v.clone());
+                invalid_value = true;
+            }
+            PortOutcome::Unknown(a) => rejected.push(a.clone()),
+            PortOutcome::Parsed(_) => {}
+        }
+    }
+    let error = if invalid_value {
+        ERROR_INVALID_PORT_VALUE.to_string()
+    } else {
+        ERROR_UNKNOWN_ARG.to_string()
+    };
+    CliError {
+        error,
+        rejected_args: rejected,
+        exit_code: EXIT_USAGE,
+    }
+}
+
+/// 错误文案常量：golden 断言对象，禁止在 render 处内联改写。
+pub const ERROR_INVALID_PORT_VALUE: &str =
+    "invalid value for --port (expected unsigned 16-bit integer)";
+pub const ERROR_UNKNOWN_ARG: &str = "unknown argument (see usage)";
 
 #[cfg(test)]
 mod tests {
@@ -162,5 +212,71 @@ mod tests {
         let (port, outcomes) = resolve_port(&[]);
         assert_eq!(port, DEFAULT_PORT);
         assert!(outcomes.is_empty());
+    }
+
+    // ---- CLI 错误路径：结构化 body + 非零退出码（#982 slice 1 同款）----
+
+    #[test]
+    fn golden_cli_error_body_unknown_arg() {
+        let args: Vec<String> = ["--verbose"].iter().map(|s| s.to_string()).collect();
+        let (_, outcomes) = resolve_port(&args);
+        let e = cli_error(&args, &outcomes);
+        assert_eq!(e.error, "unknown argument (see usage)");
+        assert_eq!(e.rejected_args, vec!["--verbose".to_string()]);
+        assert_eq!(e.exit_code, 2);
+        // 字节级 golden：字段顺序 + 内容完全钉死
+        let bytes = serde_json::to_string_pretty(&e).unwrap();
+        assert_eq!(
+            bytes,
+            "{\n  \"error\": \"unknown argument (see usage)\",\n  \"rejected_args\": [\n    \"--verbose\"\n  ],\n  \"exit_code\": 2\n}"
+        );
+    }
+
+    #[test]
+    fn golden_cli_error_body_invalid_port_value() {
+        let args: Vec<String> = ["--port=abc"].iter().map(|s| s.to_string()).collect();
+        let (_, outcomes) = resolve_port(&args);
+        let e = cli_error(&args, &outcomes);
+        assert_eq!(
+            e.error,
+            "invalid value for --port (expected unsigned 16-bit integer)"
+        );
+        assert_eq!(e.rejected_args, vec!["abc".to_string()]);
+        assert_eq!(e.exit_code, 2);
+    }
+
+    #[test]
+    fn golden_cli_error_invalid_value_wins_over_unknown() {
+        // 混合输入：invalid value 优先于 unknown 作为主错误（更具体的诊断）
+        let args: Vec<String> = ["--trace", "--port=0x10"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_, outcomes) = resolve_port(&args);
+        let e = cli_error(&args, &outcomes);
+        assert_eq!(
+            e.error,
+            "invalid value for --port (expected unsigned 16-bit integer)"
+        );
+        assert_eq!(
+            e.rejected_args,
+            vec!["--trace".to_string(), "0x10".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_cli_error_empty_when_all_valid() {
+        let args: Vec<String> = ["--port=5000"].iter().map(|s| s.to_string()).collect();
+        let (_, outcomes) = resolve_port(&args);
+        // 全合法时错误体不产生 rejected（调用方守卫先于本函数触发）
+        let e = cli_error(&args, &outcomes);
+        assert_eq!(e.error, "unknown argument (see usage)"); // 兜底词表，但守卫保证不会走到
+        assert!(e.rejected_args.is_empty());
+    }
+
+    #[test]
+    fn test_exit_usage_is_nonzero() {
+        assert!(EXIT_USAGE > 0);
+        assert_ne!(EXIT_USAGE, 1); // 与运行时失败退出码区分
     }
 }

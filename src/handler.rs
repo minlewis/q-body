@@ -753,7 +753,12 @@ mod transport_scope_tests {
     fn test_internal_method_rejected_before_dispatch() {
         // golden：internal 方法经 A2A 通道调用，分发前结构化拒绝，handler 本体不触达
         let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
-        for m in ["JournalRecord", "journal/record", "Reflect", "reflection/score"] {
+        for m in [
+            "JournalRecord",
+            "journal/record",
+            "Reflect",
+            "reflection/score",
+        ] {
             let out = tokio_test_block(h.handle_request(
                 m,
                 Some(serde_json::json!({"signal": "test", "source": "x", "suggestion": "y"})),
