@@ -133,6 +133,22 @@ pub const ERROR_INVALID_PORT_VALUE: &str =
     "invalid value for --port (expected unsigned 16-bit integer)";
 pub const ERROR_UNKNOWN_ARG: &str = "unknown argument (see usage)";
 
+// ============================================================
+// 版本自描述：编译期注入 git 短 commit（yoyo Day219 Task 2 同款）
+// ============================================================
+
+/// 编译期注入的 git 短 commit（build.rs 写入；git 不可用时缺省，绝不输出 "dev"）。
+pub const BUILD_COMMIT: Option<&str> = option_env!("QBODY_BUILD_COMMIT");
+
+/// 版本自描述串 =「版本+短 commit」（git 不可用时退化为纯 crate 版本）。
+/// 单一事实源：Cargo.toml（env!）+ build.rs 注入，运行时无硬编码、不可漂移。
+pub fn version_string() -> String {
+    match BUILD_COMMIT {
+        Some(c) if !c.is_empty() => format!("{}+{}", env!("CARGO_PKG_VERSION"), c),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +294,31 @@ mod tests {
     fn test_exit_usage_is_nonzero() {
         assert!(EXIT_USAGE > 0);
         assert_ne!(EXIT_USAGE, 1); // 与运行时失败退出码区分
+    }
+
+    // ---- 版本自描述：编译期注入，杜绝硬编码漂移（yoyo Day219 Task 2）----
+
+    #[test]
+    fn golden_version_string_crate_version_prefix() {
+        // 版本串必须以 Cargo.toml 的真实版本开头（单一事实源，非硬编码猜测）
+        assert!(version_string().starts_with(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn version_string_never_contains_bare_dev() {
+        // 铁律：绝不输出裸 "dev" —— 版本要么带真实短 commit，要么退化为纯版本号
+        let v = version_string();
+        assert!(
+            !v.contains("dev"),
+            "version string must never contain bare 'dev': {v}"
+        );
+        // 若注入了 commit，格式必为 "版本+短commit"（7 位十六进制）
+        if let Some(c) = BUILD_COMMIT {
+            assert!(!c.is_empty());
+            assert_eq!(c.len(), 7, "short commit must be 7 hex chars: {c}");
+            assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()), "{c}");
+            assert!(v.ends_with(c));
+            assert!(v.contains('+'));
+        }
     }
 }
