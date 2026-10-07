@@ -492,6 +492,18 @@ impl QBodyHandler {
                     }
                 }
                 Err(e) => {
+                    // 取消分类（借鉴 yoyo-evolve #988）：Ctrl-C/用户取消不是真实失败，
+                    // 不记 failure 事件（不污染失败计数）、不 failover（不重跑 fallback
+                    // provider），直接终止 provider 链；真实失败才走原 failover 链。
+                    if crate::queue::is_user_cancellation(&e.to_string()) {
+                        tracing::info!(
+                            "LLM call on {} canceled by user — not recording failure, not failing over",
+                            provider.name
+                        );
+                        last_err = Some("LLM request canceled by user".to_string());
+                        break;
+                    }
+
                     let full_err = format!(
                         "HTTP request to LLM {} failed: {} — failing over",
                         provider.name, e

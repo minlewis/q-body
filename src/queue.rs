@@ -10,6 +10,26 @@
 
 use std::time::SystemTime;
 
+/// 用户取消 vs 真实失败的分类词表（借鉴 yoyo-evolve #988 —
+/// Ctrl-C 取消的子 agent 不得被误读为失败）
+///
+/// #855 同款纪律：词表收窄到测试许可的程度——
+/// 每条正路径短语配一条「prose 误燃」负路径断言钉住。
+const USER_CANCELLATION_PATTERNS: &[&str] = &[
+    "operation canceled",
+    "operation cancelled",
+    "request canceled",
+    "request cancelled",
+];
+
+/// 判定 LLM HTTP 错误是否为用户主动取消（而非真实网络失败）。
+///
+/// 取消 → 不记 failure 事件、不触发 failover；真实失败 → 原链路。
+pub fn is_user_cancellation(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    USER_CANCELLATION_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 /// LLM 解析失败事件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmFailureKind {
@@ -148,5 +168,56 @@ mod tests {
         );
         assert_eq!(event.kind, LlmFailureKind::JsonParse);
         assert_eq!(event.response_length, 3281);
+    }
+
+    // === 取消分类词表（借鉴 yoyo-evolve #988）===
+    // #855 纪律：正路径短语 + prose 误燃负路径样本成对钉住
+
+    #[test]
+    fn test_cancellation_positive_paths() {
+        for msg in [
+            "operation canceled",
+            "Operation Cancelled",
+            "HTTP request failed: operation canceled by hyper",
+            "the request was cancelled before completion, reported as: operation cancelled",
+        ] {
+            assert!(is_user_cancellation(msg), "should be cancellation: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_real_failures_do_not_misfire() {
+        for msg in [
+            "connection refused: tcp connect error",
+            "dns error resolving api.example.com",
+            "connection timed out after 30s",
+            "channel closed",
+            "request body failed to send",
+            "we canceled the deadline extension discussion in the changelog notes",
+        ] {
+            assert!(
+                !is_user_cancellation(msg),
+                "real failure misclassified as cancellation: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_not_required_but_phrase_is_exact() {
+        // 词表是完整短语匹配，不是裸词——裸 "cancel" 会误燃 prose
+        assert!(!is_user_cancellation("canceled")); // 裸词不够，必须有完整短语
+        assert!(is_user_cancellation("error: operation canceled"));
+    }
+
+    #[test]
+    fn test_cancellation_kind_not_in_failure_vocab() {
+        // 取消不是 failure kind：LlmFailureKind 三个变体都不该出现在取消路径上
+        let kinds = [
+            LlmFailureKind::HttpRequest.as_str(),
+            LlmFailureKind::ApiError.as_str(),
+            LlmFailureKind::JsonParse.as_str(),
+        ];
+        assert!(!kinds.contains(&"canceled"));
+        assert!(!kinds.contains(&"cancelled"));
     }
 }
