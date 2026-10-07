@@ -172,8 +172,9 @@ async fn main() {
             organization: "Q宝宝实验室".into(),
             url: "https://github.com/q-baby".into(),
         }),
-        // 单一事实源：编译期从 Cargo.toml 取版本，杜绝与包版本漂移
-        version: env!("CARGO_PKG_VERSION").into(),
+        // 单一事实源：编译期从 Cargo.toml 取版本 + build.rs 注入 git 短 commit
+        //（yoyo Day219 Task 2 同款：版本自描述且不可漂移）
+        version: usage::version_string(),
         capabilities: Some(AgentCapabilities {
             streaming: false,
             push_notifications: false,
