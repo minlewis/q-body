@@ -18,6 +18,38 @@ const CMD_TIMEOUT_SECS: u64 = 15;
 /// 工具输出回喂 LLM 的字符上限——防爆 prompt（复用 clamp 哲学）。
 const OUTPUT_CLAMP_CHARS: usize = 4000;
 
+/// 工具结果三态分类（issue #140）。
+/// 空匹配是合法成功（grep 无命中 / 空文件），路径缺失与不可读是错误——
+/// 三者不可混为一个「空结果 exit 0」（借鉴 yoyo Day 221 grep 语义诚实化）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum ToolResultKind {
+    /// 合法成功但零结果。
+    EmptyMatch,
+    /// 路径不存在 → 错误。
+    PathMissing,
+    /// 存在但读不了（权限/目录/编码等）→ 错误。
+    Unreadable,
+}
+
+/// io::Error → 三态：NotFound 归路径缺失，其余（PermissionDenied /
+/// IsADirectory / InvalidData…）归不可读。失败路径必须可区分，不许全折叠。
+pub fn classify_io_error(e: &std::io::Error) -> ToolResultKind {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ToolResultKind::PathMissing,
+        _ => ToolResultKind::Unreadable,
+    }
+}
+
+/// 非零退出 + 零输出的诚实语义：退出码如实呈现，不许称「成功」。
+/// exit=0 无输出是合法空结果；exit!=0 无输出必须显式标为非零退出。
+pub fn empty_output_verdict(exit_code: i32) -> String {
+    if exit_code == 0 {
+        "(命令完成，exit=0，无输出——空结果是合法结果)".to_string()
+    } else {
+        format!("(exit={exit_code}，非零退出且无输出——如 grep 无命中属空匹配，其余需结合退出码判断失败)")
+    }
+}
+
 /// 声明给 LLM 的工具 schema（OpenAI function-calling 格式）。
 pub fn tool_specs() -> serde_json::Value {
     json!([
@@ -129,7 +161,13 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
             };
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => clamp_output(content),
-                Err(e) => format!("读取失败：{e}"),
+                // 三态诚实分类（issue #140）：路径不存在 ≠ 不可读，错误消息可区分
+                Err(e) => match classify_io_error(&e) {
+                    ToolResultKind::PathMissing => {
+                        format!("读取失败（路径不存在）：{path}")
+                    }
+                    _ => format!("读取失败（不可读：{}）：{path}", e),
+                },
             }
         }
         other => format!("工具错误：未知工具 `{other}`"),
@@ -161,7 +199,8 @@ async fn run_shell(command: &str) -> String {
                 combined.push_str(&stderr);
             }
             if combined.trim().is_empty() {
-                combined = format!("(命令成功退出，exit={}，无输出)", out.status.code().unwrap_or(-1));
+                // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
+                combined = empty_output_verdict(out.status.code().unwrap_or(-1));
             } else if !out.status.success() {
                 combined = format!("exit={}\n{combined}", out.status.code().unwrap_or(-1));
             }
@@ -209,6 +248,58 @@ mod tests {
     async fn read_file_missing_reports_error() {
         let out = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
         assert!(out.contains("读取失败"));
+    }
+
+    // ---- issue #140：三态诚实分类，失败路径测试钉死 ----
+
+    #[test]
+    fn io_error_not_found_is_path_missing() {
+        let e = std::fs::read_to_string("/nonexistent-xyz-123").unwrap_err();
+        assert_eq!(classify_io_error(&e), ToolResultKind::PathMissing);
+    }
+
+    #[test]
+    fn io_error_directory_is_unreadable_not_missing() {
+        // 目录存在但 read_to_string 读不了 → Unreadable，不得折叠进 PathMissing
+        let e = std::fs::read_to_string("/tmp").unwrap_err();
+        assert_eq!(classify_io_error(&e), ToolResultKind::Unreadable);
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_says_path_missing() {
+        let out = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
+        assert!(out.contains("路径不存在"), "got: {out}");
+        assert!(!out.contains("不可读"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn read_file_directory_says_unreadable() {
+        let out = dispatch("read_file", &json!({"path": "/tmp"})).await;
+        assert!(out.contains("不可读"), "got: {out}");
+        assert!(!out.contains("路径不存在"), "got: {out}");
+    }
+
+    #[test]
+    fn zero_exit_no_output_is_empty_match_not_success_lie() {
+        let v = empty_output_verdict(0);
+        assert!(v.contains("exit=0") && v.contains("合法"), "got: {v}");
+        assert!(!v.contains("成功退出"), "不许谎报成功: {v}");
+    }
+
+    #[test]
+    fn nonzero_exit_no_output_is_not_reported_as_success() {
+        // grep 无命中 exit=1 + 零输出的旧实现会打出「命令成功退出，exit=1」——语义自欺
+        let v = empty_output_verdict(1);
+        assert!(v.contains("exit=1") && v.contains("非零退出"), "got: {v}");
+        assert!(!v.contains("成功"), "不许谎报成功: {v}");
+    }
+
+    #[tokio::test]
+    async fn grep_no_match_reports_nonzero_exit_honestly() {
+        // 端到端失败路径：真实 shell 探针，exit=1 零输出不得含「成功」
+        let out = dispatch("run_readonly", &json!({"command": "grep -c zzzzqqqq /etc/hostname"})).await;
+        assert!(!out.contains("成功"), "got: {out}");
+        assert!(out.contains("exit=1"), "got: {out}");
     }
 
     #[test]
