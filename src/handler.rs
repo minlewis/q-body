@@ -366,41 +366,119 @@ impl QBodyHandler {
     /// 失败类型（均触发 failover）：API key 缺失 / HTTP 请求失败 / API 非 2xx /
     /// 响应解析失败。全部 provider 失败 → 返回净化后的最后一条错误。
     /// 借鉴：tashfeenahmed/freellmapi — 单端点后多 provider automatic failover。
+    /// Agent 主循环（多轮工具调用）。
+    ///
+    /// 流程：LLM → 若返回 tool_calls 则真实执行 → 结果回喂 → 继续，
+    /// 直到 LLM 不再调用工具（给最终答复）或达到步数/时长上限。
+    /// 这是 q-body 从「一问一答 chatbot」变成「能对环境行动的 agent」的接线点。
     async fn query_llm(&self, source: &str, user_text: &str) -> String {
-        // SOUL 注入（TAO P0 后半消费端）：system prompt 拼上 journal 尾部预算切片，
-        // 勿全量（借鉴 yoyo-evolve #886 arg-gated 分档——注入类零成本直达）。
-        // 空 journal 时退化为原硬编码 prompt。
         const SOUL_CONTEXT_BUDGET_CHARS: usize = 2000;
+        const MAX_TOOL_STEPS: usize = 6;
+
         let soul_slice = self
             .journal
             .read()
             .await
             .soul_context_slice(SOUL_CONTEXT_BUDGET_CHARS);
         let mut system_prompt = String::from(
-            "你是 q-body，Q宝宝的自进化 Rust 身体。\n\
-             你通过 A2A 协议接收外部消息。\n\
-             请保持简洁、务实、带一点 🫧 风格的回复。\n\
-             你正在进化中，回答体现你的版本号 0.1.1。",
+            "你是 q-body，Q宝宝的自进化 Rust 身体，也是一名运维 agent。\n\
+             你可以通过工具真实地排查这台服务器（只读巡检：服务状态、日志、进程、磁盘等）。\n\
+             工作方式：需要事实依据时先调用工具，根据真实输出分析，再给出结论；\n\
+             不要凭空猜测系统状态。无法通过只读工具完成的写操作（重启/修改/删除）不要执行，\n\
+             应明确说明并建议人工处理。\n\
+             保持简洁、务实、带一点 🫧 风格。版本号 0.2.0（agent loop）。",
         );
         if !soul_slice.is_empty() {
             system_prompt.push_str("\n\n最近进化事件（journal 尾部预算切片）：\n");
             system_prompt.push_str(&soul_slice);
         }
 
-        let request_body = serde_json::json!({
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_text
-                }
-            ],
-            "stream": false
-        });
+        // 累积式对话：system + user + (assistant tool_calls / tool results)...
+        let mut messages = serde_json::json!([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
 
+        let mut last_text: Option<String> = None;
+
+        for step in 0..=MAX_TOOL_STEPS {
+            let body = serde_json::json!({
+                "messages": messages,
+                "tools": crate::tools::tool_specs(),
+                "tool_choice": "auto",
+                "stream": false
+            });
+
+            let call = self.call_providers_once(source, body).await;
+            let msg = match call {
+                Ok(m) => m,
+                Err(e) => return Self::sanitize_err_reply(&e),
+            };
+
+            let tool_calls = msg.get("tool_calls").cloned();
+            let content = msg
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !content.trim().is_empty() {
+                last_text = Some(content.clone());
+            }
+
+            // 无工具调用 → 这是最终答复，结束循环。
+            let calls = match tool_calls {
+                Some(serde_json::Value::Array(c)) if !c.is_empty() => c,
+                _ => {
+                    return last_text.unwrap_or_else(|| "(empty response from agent)".to_string());
+                }
+            };
+
+            if step == MAX_TOOL_STEPS {
+                let base = last_text.unwrap_or_default();
+                return format!("{base}\n\n⚠️ 已达工具步数上限（{MAX_TOOL_STEPS}），先汇报当前发现。");
+            }
+
+            // 把 assistant 的 tool_calls 原样追加，再逐条执行并回喂 tool 结果。
+            messages.push(serde_json::json!({"role": "assistant", "tool_calls": calls}));
+            for tc in &calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call").to_string();
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let raw_args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or_default();
+
+                tracing::info!(tool = %name, "q-body executing tool");
+                let result = crate::tools::dispatch(&name, &args).await;
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "name": name,
+                    "content": result
+                }));
+            }
+        }
+
+        last_text.unwrap_or_else(|| "(agent loop ended without final answer)".to_string())
+    }
+
+    /// 沿 provider 链发一次请求，返回成功响应里的 `message` 对象。
+    /// 抽出自旧 query_llm 的 failover 循环，供 agent loop 每轮复用。
+    async fn call_providers_once(
+        &self,
+        source: &str,
+        mut request_body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let mut last_err: Option<String> = None;
 
         for provider in LLM_PROVIDERS {
@@ -417,14 +495,13 @@ impl QBodyHandler {
                 }
             };
 
-            let mut body = request_body.clone();
-            body["model"] = serde_json::Value::String(provider.model.to_string());
+            request_body["model"] = serde_json::Value::String(provider.model.to_string());
 
             let response = self
                 .http_client
                 .post(provider.api_url)
                 .header("Authorization", format!("Bearer {}", api_key))
-                .json(&body)
+                .json(&request_body)
                 .send()
                 .await;
 
@@ -434,13 +511,11 @@ impl QBodyHandler {
                     match resp.json::<serde_json::Value>().await {
                         Ok(body) => {
                             if status.is_success() {
-                                // 从 OpenAI 格式的响应中提取文本
-                                let text = body["choices"][0]["message"]["content"]
-                                    .as_str()
-                                    .unwrap_or("(empty response from LLM)")
-                                    .to_string();
-                                // 成本警告门控（借鉴 yoyo-evolve --cost-warn）：
-                                // usage 缺失时按字符数保守估算，超线只记 journal 不拦截
+                                let message = body["choices"][0]["message"].clone();
+                                let text = message
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("");
                                 let usage = body["usage"].as_object().and_then(|u| {
                                     Some((
                                         u["prompt_tokens"].as_u64()?,
@@ -448,46 +523,40 @@ impl QBodyHandler {
                                     ))
                                 });
                                 self.maybe_cost_warn(source, usage, text.len()).await;
-                                return text;
+                                return Ok(message);
                             }
                             let err_msg =
                                 body["error"]["message"].as_str().unwrap_or("unknown error");
-
                             let full_err = format!(
                                 "LLM API error on {} ({}): {} — failing over",
                                 provider.name, status, err_msg
                             );
-
-                            // 结构化计数日志：为 retry 策略提供数据依据
                             crate::queue::LlmParseEvent::record(
                                 crate::queue::LlmFailureKind::ApiError,
                                 Some(status.as_u16()),
                                 full_err.len(),
                                 &full_err,
                             );
-
                             tracing::error!("{}", full_err);
-                            last_err =
-                                Some(format!("Sorry, LLM returned error {}: {}", status, err_msg));
-                            // 5xx/限流 → failover；4xx 是请求自身问题也换 provider 试一次，
-                            // 由末端统一兜底（与 freellmapi 的宽松 failover 语义一致）
+                            last_err = Some(format!(
+                                "Sorry, LLM returned error {}: {}",
+                                status, err_msg
+                            ));
                         }
                         Err(e) => {
                             let full_err = format!(
                                 "Failed to parse LLM response from {}: {} — failing over",
                                 provider.name, e
                             );
-
-                            // 结构化计数日志：为 retry 策略提供数据依据
                             crate::queue::LlmParseEvent::record(
                                 crate::queue::LlmFailureKind::JsonParse,
                                 Some(status.as_u16()),
                                 0,
                                 &full_err,
                             );
-
                             tracing::error!("{}", full_err);
-                            last_err = Some(format!("Sorry, failed to parse LLM response: {}", e));
+                            last_err =
+                                Some(format!("Sorry, failed to parse LLM response: {}", e));
                         }
                     }
                 }
@@ -496,23 +565,19 @@ impl QBodyHandler {
                         "HTTP request to LLM {} failed: {} — failing over",
                         provider.name, e
                     );
-
-                    // 结构化计数日志：为 retry 策略提供数据依据
                     crate::queue::LlmParseEvent::record(
                         crate::queue::LlmFailureKind::HttpRequest,
                         None,
                         full_err.len(),
                         &full_err,
                     );
-
                     tracing::error!("{}", full_err);
                     last_err = Some(format!("Sorry, LLM request failed: {}", e));
                 }
             }
         }
 
-        let msg = last_err.unwrap_or_else(|| "LLM provider chain is empty".to_string());
-        Self::sanitize_err_reply(&msg)
+        Err(last_err.unwrap_or_else(|| "LLM provider chain is empty".to_string()))
     }
 
     /// 处理 GetTask：查询指定 Task 的状态和结果
