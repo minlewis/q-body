@@ -21,7 +21,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderValue, Method, StatusCode},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use tower_http::cors::CorsLayer;
@@ -41,6 +41,7 @@ mod state;
 mod trust_input;
 mod usage;
 mod validator;
+mod webui;
 
 // ============================================================
 // standalone 纯函数模块（learnings / clamp / darkroom 同先例）：
@@ -59,6 +60,14 @@ struct AppState {
     handler: QBodyHandler,
     /// 进程启动时刻（/health uptime 自证用）
     started_at: std::time::SystemTime,
+}
+
+// ============================================================
+// Web UI — 浏览器聊天页面（SSH 隧道使用；服务只绑 127.0.0.1）
+// ============================================================
+
+async fn get_index() -> impl IntoResponse {
+    Html(webui::CHAT_HTML)
 }
 
 // ============================================================
@@ -232,6 +241,7 @@ async fn main() {
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     let app = Router::new()
+        .route("/", get(get_index))
         .route("/.well-known/agent-card.json", get(get_agent_card))
         .route("/health", get(get_health))
         .route("/a2a/jsonrpc", post(jsonrpc_handler))
