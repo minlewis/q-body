@@ -34,7 +34,65 @@ struct LlmProvider {
 }
 
 /// provider 故障转移链：按序尝试；链首向后兼容现存部署（只配 ARK_API_KEY 也能跑）
-const LLM_PROVIDERS: &[LlmProvider] = &[
+///
+/// 配置来源单一事实源（借鉴 yolo-evolve Day222 Task1/2）：
+/// 1. `QBODY_LLM_PROVIDERS_JSON`（优先）— JSON 数组，元素字段
+///    `api_key_env` / `api_url` / `model` / `name` 全部必填（缺字段该 provider 报弃）；
+/// 2. 显式关闭 — 设 `QBODY_LLM_PROVIDERS_NONE=1` 得空链（全部 LLM 路径诚实报错，
+///    供纯净环境测试/探针）；
+/// 3. 内置默认链兜底。
+fn llm_provider_chain() -> Vec<LlmProvider> {
+    if std::env::var("QBODY_LLM_PROVIDERS_NONE").as_deref() == Ok("1") {
+        return Vec::new();
+    }
+    if let Ok(raw) = std::env::var("QBODY_LLM_PROVIDERS_JSON") {
+        if !raw.trim().is_empty() {
+            match serde_json::from_str::<Vec<ProviderCfg>>(&raw) {
+                Ok(cfgs) if !cfgs.is_empty() => {
+                    return cfgs.into_iter().filter_map(LlmProvider::from_cfg).collect();
+                }
+                _ => {
+                    // fail-loud：配置存在但无效时退回默认链并告警，不让 typo 静默裸奔
+                    tracing::error!(
+                        "QBODY_LLM_PROVIDERS_JSON set but invalid/empty — falling back to built-in provider chain"
+                    );
+                }
+            }
+        }
+    }
+    DEFAULT_LLM_PROVIDERS.iter().copied().collect()
+}
+
+/// 可解析的 provider 配置条目（JSON 中间形态，字段缺一即弃）
+#[derive(serde::Deserialize)]
+struct ProviderCfg {
+    api_key_env: String,
+    api_url: String,
+    model: String,
+    name: String,
+}
+
+impl LlmProvider {
+    /// String 字段 → 常驻内存（'static）引用；空值或非法字段整条报弃
+    fn from_cfg(cfg: ProviderCfg) -> Option<LlmProvider> {
+        fn leak_nonempty(s: String, what: &str) -> Option<&'static str> {
+            if s.trim().is_empty() {
+                tracing::error!("LLM provider config: empty {what} field — entry dropped");
+                return None;
+            }
+            Some(Box::leak(s.into_boxed_str()))
+        }
+        Some(LlmProvider {
+            api_key_env: leak_nonempty(cfg.api_key_env, "api_key_env")?,
+            api_url: leak_nonempty(cfg.api_url, "api_url")?,
+            model: leak_nonempty(cfg.model, "model")?,
+            name: leak_nonempty(cfg.name, "name")?,
+        })
+    }
+}
+
+/// 内置默认 provider 链：ark 主 → deepseek-platform 备
+const DEFAULT_LLM_PROVIDERS: &[LlmProvider] = &[
     LlmProvider {
         api_key_env: "ARK_API_KEY",
         api_url: "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions",
@@ -481,7 +539,7 @@ impl QBodyHandler {
     ) -> Result<serde_json::Value, String> {
         let mut last_err: Option<String> = None;
 
-        for provider in LLM_PROVIDERS {
+        for provider in llm_provider_chain() {
             let api_key = match std::env::var(provider.api_key_env) {
                 Ok(k) if !k.trim().is_empty() => k,
                 _ => {
@@ -703,19 +761,19 @@ mod failover_tests {
     use super::*;
 
     #[test]
-    fn test_provider_chain_not_empty() {
-        assert!(!LLM_PROVIDERS.is_empty());
+    fn test_default_chain_not_empty() {
+        assert!(!DEFAULT_LLM_PROVIDERS.is_empty());
     }
 
     #[test]
     fn test_chain_head_keeps_ark_primary() {
         // 链首向后兼容现存部署：只配 ARK_API_KEY 的环境行为不变
-        assert_eq!(LLM_PROVIDERS[0].api_key_env, "ARK_API_KEY");
+        assert_eq!(DEFAULT_LLM_PROVIDERS[0].api_key_env, "ARK_API_KEY");
     }
 
     #[test]
     fn test_chain_urls_are_https() {
-        for p in LLM_PROVIDERS {
+        for p in DEFAULT_LLM_PROVIDERS {
             assert!(
                 p.api_url.starts_with("https://"),
                 "{} must be https",
@@ -727,7 +785,7 @@ mod failover_tests {
     #[test]
     fn test_chain_names_unique() {
         // provider 短名用于 tracing 日志，重名会让 failover 归因失真
-        let mut names: Vec<_> = LLM_PROVIDERS.iter().map(|p| p.name).collect();
+        let mut names: Vec<_> = DEFAULT_LLM_PROVIDERS.iter().map(|p| p.name).collect();
         let n = names.len();
         names.sort_unstable();
         names.dedup();
@@ -737,7 +795,7 @@ mod failover_tests {
     #[test]
     fn test_env_names_are_key_names_only() {
         // 链里只允许存环境变量名（键名），任何值形态的字符串都不该出现
-        for p in LLM_PROVIDERS {
+        for p in DEFAULT_LLM_PROVIDERS {
             assert!(
                 p.api_key_env.ends_with("_KEY") || p.api_key_env.ends_with("_TOKEN"),
                 "{} stores more than a key name",
@@ -748,10 +806,69 @@ mod failover_tests {
 
     #[test]
     fn test_chain_models_nonempty() {
-        for p in LLM_PROVIDERS {
+        for p in DEFAULT_LLM_PROVIDERS {
             assert!(!p.model.is_empty());
             assert!(!p.api_url.is_empty());
         }
+    }
+
+    // ---- 配置单一事实源（QBODY_LLM_PROVIDERS_JSON / _NONE）—— env 测试持全局锁（09-16 判例）----
+
+    #[test]
+    fn test_none_flag_yields_empty_chain() {
+        let _g = crate::test_env_lock::env_lock_guard();
+        unsafe { std::env::set_var("QBODY_LLM_PROVIDERS_NONE", "1") };
+        assert!(llm_provider_chain().is_empty());
+        unsafe { std::env::remove_var("QBODY_LLM_PROVIDERS_NONE") };
+        assert!(!llm_provider_chain().is_empty());
+    }
+
+    #[test]
+    fn test_json_override_replaces_chain() {
+        let _g = crate::test_env_lock::env_lock_guard();
+        let raw = r#"[{"api_key_env":"TEST_KEY_X","api_url":"https://example.test/v1","model":"m1","name":"x"},{"api_key_env":"TEST_KEY_Y","api_url":"https://alt.test/v1","model":"m2","name":"y"}]"#;
+        unsafe { std::env::set_var("QBODY_LLM_PROVIDERS_JSON", raw) };
+        let chain = llm_provider_chain();
+        unsafe { std::env::remove_var("QBODY_LLM_PROVIDERS_JSON") };
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].api_key_env, "TEST_KEY_X");
+        assert_eq!(chain[1].name, "y");
+        // 未配置时回落内置链
+        assert_eq!(llm_provider_chain().len(), DEFAULT_LLM_PROVIDERS.len());
+    }
+
+    #[test]
+    fn test_invalid_json_fails_back_to_default() {
+        // fail-loud 而非静默裸奔：坏配置打 error 日志后回落内置链
+        let _g = crate::test_env_lock::env_lock_guard();
+        unsafe { std::env::set_var("QBODY_LLM_PROVIDERS_JSON", "{not json") };
+        let chain = llm_provider_chain();
+        unsafe { std::env::remove_var("QBODY_LLM_PROVIDERS_JSON") };
+        assert_eq!(chain.len(), DEFAULT_LLM_PROVIDERS.len());
+    }
+
+    #[test]
+    fn test_entry_missing_field_is_dropped() {
+        // "查表无 reader 即 fail-loud" 同款：字段缺失/空值的条目整条报弃，不产出半残 provider
+        let _g = crate::test_env_lock::env_lock_guard();
+        let raw = r#"[{"api_key_env":"TEST_KEY_X","api_url":"","model":"m1","name":"x"},{"api_key_env":"TEST_KEY_Y","api_url":"https://alt.test/v1","model":"m2","name":"y"}]"#;
+        unsafe { std::env::set_var("QBODY_LLM_PROVIDERS_JSON", raw) };
+        let chain = llm_provider_chain();
+        unsafe { std::env::remove_var("QBODY_LLM_PROVIDERS_JSON") };
+        assert_eq!(chain.len(), 1, "empty api_url entry must be dropped");
+        assert_eq!(chain[0].name, "y");
+    }
+
+    #[test]
+    fn test_custom_chain_head_is_used_first() {
+        // 覆盖链的链首优先于内置默认链（failover 顺序由配置决定）
+        let _g = crate::test_env_lock::env_lock_guard();
+        let raw = r#"[{"api_key_env":"TEST_KEY_Y","api_url":"https://alt.test/v1","model":"m2","name":"y"}]"#;
+        unsafe { std::env::set_var("QBODY_LLM_PROVIDERS_JSON", raw) };
+        let chain = llm_provider_chain();
+        unsafe { std::env::remove_var("QBODY_LLM_PROVIDERS_JSON") };
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].api_key_env, "TEST_KEY_Y");
     }
 }
 
