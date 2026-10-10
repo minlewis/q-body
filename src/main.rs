@@ -167,9 +167,13 @@ async fn main() {
         let err = usage::cli_error(&arg_strings, &outcomes);
         eprintln!(
             "{}",
-            serde_json::to_string_pretty(&err)
-                .unwrap_or_else(|_| format!("{{\"error\":\"{}\",\"exit_code\":2}}", err.error))
+            serde_json::to_string_pretty(&err).unwrap_or_else(|_| format!(
+                "{{\"error\":\"{}\",\"exit_code\":{}}}",
+                err.error, err.exit_code
+            ))
         );
+        // Day223 Task 1：打印 usage 的同时非零退出——error body 之外补 usage 块
+        eprintln!("{}", usage::usage_with_exit_hint(err.exit_code));
         std::process::exit(err.exit_code);
     }
 
@@ -221,7 +225,9 @@ async fn main() {
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(&usage::missing_resource_error(&reason))
-                    .unwrap_or_else(|_| "{\"error\":\"missing or unusable resource\",\"exit_code\":1}".into())
+                    .unwrap_or_else(|_| {
+                        "{\"error\":\"missing or unusable resource\",\"exit_code\":1}".into()
+                    })
             );
             std::process::exit(usage::EXIT_MISSING_RESOURCE);
         }
@@ -293,7 +299,9 @@ async fn main() {
                     eprintln!(
                         "{}",
                         serde_json::to_string_pretty(&usage::internal_error(&io_err.to_string()))
-                            .unwrap_or_else(|_| "{\"error\":\"internal error\",\"exit_code\":70}".into())
+                            .unwrap_or_else(
+                                |_| "{\"error\":\"internal error\",\"exit_code\":70}".into()
+                            )
                     );
                     std::process::exit(usage::EXIT_INTERNAL);
                 }
