@@ -13,6 +13,34 @@ use serde_json::json;
 use std::process::Command;
 use tokio::time::{Duration, timeout};
 
+/// 工具结果二态（issue #146 / backlog 2026-10-10）：
+/// 动作实际未发生（被拦截/缺参/未知工具/超时/执行失败/路径错误）时禁止伪装成
+/// 成功形状的纯文本回喂——必须显式 Failed（借鉴 yolo #982 commit no-op fail-loud）。
+/// 空匹配（exit=0 无输出 / grep 无命中）仍是合法成功（#140 语义不回退）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ToolStatus {
+    /// 动作已发生且成功（含合法空结果）。
+    Ok,
+    /// 动作未发生或失败——fail-loud，不得当成功消费。
+    Failed,
+}
+
+/// dispatch 的结构化返回：status 供调用方/日志判定，content 仍回喂 LLM。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ToolOutcome {
+    pub status: ToolStatus,
+    pub content: String,
+}
+
+impl ToolOutcome {
+    pub fn ok(content: impl Into<String>) -> Self {
+        ToolOutcome { status: ToolStatus::Ok, content: content.into() }
+    }
+    pub fn failed(content: impl Into<String>) -> Self {
+        ToolOutcome { status: ToolStatus::Failed, content: content.into() }
+    }
+}
+
 /// 单次命令执行上限（秒）——防止挂死/无限输出型命令。
 const CMD_TIMEOUT_SECS: u64 = 15;
 /// 工具输出回喂 LLM 的字符上限——防爆 prompt（复用 clamp 哲学）。
@@ -143,38 +171,39 @@ fn clamp_output(s: String) -> String {
     }
 }
 
-/// 分发并执行一次工具调用，返回回喂给 LLM 的结果字符串。
-pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
+/// 分发并执行一次工具调用，返回结构化结果。
+/// Failed 状态 = 动作未发生（拦截/缺参/未知工具/超时/IO 失败），调用方据此 fail-loud。
+pub async fn dispatch(name: &str, args: &serde_json::Value) -> ToolOutcome {
     match name {
         "run_readonly" => {
             let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
-                return "工具错误：缺少 command 参数".to_string();
+                return ToolOutcome::failed("工具错误：缺少 command 参数");
             };
             if let Err(rej) = validate_readonly(command) {
-                return format!("⛔ 安全拦截（未执行）：{rej}");
+                return ToolOutcome::failed(format!("⛔ 安全拦截（未执行）：{rej}"));
             }
             run_shell(command).await
         }
         "read_file" => {
             let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-                return "工具错误：缺少 path 参数".to_string();
+                return ToolOutcome::failed("工具错误：缺少 path 参数");
             };
             match tokio::fs::read_to_string(path).await {
-                Ok(content) => clamp_output(content),
+                Ok(content) => ToolOutcome::ok(clamp_output(content)),
                 // 三态诚实分类（issue #140）：路径不存在 ≠ 不可读，错误消息可区分
                 Err(e) => match classify_io_error(&e) {
-                    ToolResultKind::PathMissing => {
-                        format!("读取失败（路径不存在）：{path}")
-                    }
-                    _ => format!("读取失败（不可读：{}）：{path}", e),
+                    ToolResultKind::PathMissing => ToolOutcome::failed(format!(
+                        "读取失败（路径不存在）：{path}"
+                    )),
+                    _ => ToolOutcome::failed(format!("读取失败（不可读：{}）：{path}", e)),
                 },
             }
         }
-        other => format!("工具错误：未知工具 `{other}`"),
+        other => ToolOutcome::failed(format!("工具错误：未知工具 `{other}`")),
     }
 }
 
-async fn run_shell(command: &str) -> String {
+async fn run_shell(command: &str) -> ToolOutcome {
     let cmd = command.to_string();
     let result = timeout(Duration::from_secs(CMD_TIMEOUT_SECS), async move {
         tokio::task::spawn_blocking(move || {
@@ -185,8 +214,8 @@ async fn run_shell(command: &str) -> String {
     .await;
 
     match result {
-        Err(_) => format!("超时：命令执行超过 {CMD_TIMEOUT_SECS}s，已终止"),
-        Ok(Err(join_err)) => format!("执行失败：{join_err}"),
+        Err(_) => ToolOutcome::failed(format!("超时：命令执行超过 {CMD_TIMEOUT_SECS}s，已终止")),
+        Ok(Err(join_err)) => ToolOutcome::failed(format!("执行失败：{join_err}")),
         Ok(Ok(Ok(out))) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -200,13 +229,22 @@ async fn run_shell(command: &str) -> String {
             }
             if combined.trim().is_empty() {
                 // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
-                combined = empty_output_verdict(out.status.code().unwrap_or(-1));
+                let code = out.status.code().unwrap_or(-1);
+                combined = empty_output_verdict(code);
+                // exit=0 无输出 = 合法空结果（grep 无命中）；非零退出 = 动作未按预期发生
+                if code == 0 {
+                    ToolOutcome::ok(combined)
+                } else {
+                    ToolOutcome::failed(combined)
+                }
             } else if !out.status.success() {
-                combined = format!("exit={}\n{combined}", out.status.code().unwrap_or(-1));
+                let code = out.status.code().unwrap_or(-1);
+                ToolOutcome::failed(format!("exit={code}\n{combined}"))
+            } else {
+                ToolOutcome::ok(clamp_output(combined))
             }
-            clamp_output(combined)
         }
-        Ok(Ok(Err(e))) => format!("执行失败：{e}"),
+        Ok(Ok(Err(e))) => ToolOutcome::failed(format!("执行失败：{e}")),
     }
 }
 
@@ -217,37 +255,43 @@ mod tests {
     #[tokio::test]
     async fn readonly_runs_df() {
         let out = dispatch("run_readonly", &json!({"command": "df -h /"})).await;
-        assert!(out.contains("/") || out.contains("Filesystem"));
+        assert_eq!(out.status, ToolStatus::Ok, "got: {out:?}");
+        assert!(out.content.contains("/") || out.content.contains("Filesystem"));
     }
 
     #[tokio::test]
     async fn rejects_non_whitelisted_bin() {
         let out = dispatch("run_readonly", &json!({"command": "python3 -c 'print(1)'"})).await;
-        assert!(out.contains("安全拦截"));
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("安全拦截"));
     }
 
     #[tokio::test]
     async fn rejects_write_even_with_allowed_bin() {
         let out = dispatch("run_readonly", &json!({"command": "systemctl restart nginx"})).await;
-        assert!(out.contains("安全拦截"));
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("安全拦截"));
     }
 
     #[tokio::test]
     async fn rejects_redirect() {
         let out = dispatch("run_readonly", &json!({"command": "ls > /tmp/x"})).await;
-        assert!(out.contains("安全拦截"));
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("安全拦截"));
     }
 
     #[tokio::test]
     async fn read_file_works() {
         let out = dispatch("read_file", &json!({"path": "/etc/hostname"})).await;
-        assert!(!out.trim().is_empty());
+        assert_eq!(out.status, ToolStatus::Ok);
+        assert!(!out.content.trim().is_empty());
     }
 
     #[tokio::test]
     async fn read_file_missing_reports_error() {
         let out = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
-        assert!(out.contains("读取失败"));
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("读取失败"));
     }
 
     // ---- issue #140：三态诚实分类，失败路径测试钉死 ----
@@ -268,15 +312,17 @@ mod tests {
     #[tokio::test]
     async fn read_file_missing_says_path_missing() {
         let out = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
-        assert!(out.contains("路径不存在"), "got: {out}");
-        assert!(!out.contains("不可读"), "got: {out}");
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("路径不存在"), "got: {:?}", out);
+        assert!(!out.content.contains("不可读"), "got: {:?}", out);
     }
 
     #[tokio::test]
     async fn read_file_directory_says_unreadable() {
         let out = dispatch("read_file", &json!({"path": "/tmp"})).await;
-        assert!(out.contains("不可读"), "got: {out}");
-        assert!(!out.contains("路径不存在"), "got: {out}");
+        assert_eq!(out.status, ToolStatus::Failed);
+        assert!(out.content.contains("不可读"), "got: {:?}", out);
+        assert!(!out.content.contains("路径不存在"), "got: {:?}", out);
     }
 
     #[test]
@@ -298,8 +344,42 @@ mod tests {
     async fn grep_no_match_reports_nonzero_exit_honestly() {
         // 端到端失败路径：真实 shell 探针，exit=1 零输出不得含「成功」
         let out = dispatch("run_readonly", &json!({"command": "grep -c zzzzqqqq /etc/hostname"})).await;
-        assert!(!out.contains("成功"), "got: {out}");
-        assert!(out.contains("exit=1"), "got: {out}");
+        assert_eq!(out.status, ToolStatus::Failed, "非零退出不得标 Ok: {out:?}");
+        assert!(!out.content.contains("成功"), "got: {:?}", out);
+        assert!(out.content.contains("exit=1"), "got: {:?}", out);
+    }
+
+    // ---- issue #146 / backlog 2026-10-10：no-op fail-loud 二态 ----
+
+    #[test]
+    fn empty_output_zero_exit_is_ok_not_failed() {
+        // grep exit=0 无输出 = 合法空结果，仍是 Ok（#140 语义不回退）
+        let v = empty_output_verdict(0);
+        assert!(v.contains("exit=0") && v.contains("合法"));
+    }
+
+    #[tokio::test]
+    async fn noop_paths_all_fail_loud() {
+        // 拦截（动作未发生）
+        let blocked = dispatch("run_readonly", &json!({"command": "rm -rf /tmp/zzz"})).await;
+        assert_eq!(blocked.status, ToolStatus::Failed);
+        // 缺参（动作未发生）
+        let missing = dispatch("run_readonly", &json!({})).await;
+        assert_eq!(missing.status, ToolStatus::Failed);
+        let missing_path = dispatch("read_file", &json!({})).await;
+        assert_eq!(missing_path.status, ToolStatus::Failed);
+        // 未知工具（动作未发生）
+        let unknown = dispatch("no_such_tool", &json!({})).await;
+        assert_eq!(unknown.status, ToolStatus::Failed);
+        // 路径缺失（动作未发生）
+        let bad_path = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
+        assert_eq!(bad_path.status, ToolStatus::Failed);
+        // 非零退出且无输出（动作未按预期发生）
+        let nonzero = dispatch("run_readonly", &json!({"command": "grep -c zzzzqqqq /etc/hostname"})).await;
+        assert_eq!(nonzero.status, ToolStatus::Failed);
+        // 真实成功（对照：动作已发生）
+        let good = dispatch("run_readonly", &json!({"command": "date"})).await;
+        assert_eq!(good.status, ToolStatus::Ok);
     }
 
     #[test]
