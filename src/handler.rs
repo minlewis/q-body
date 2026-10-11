@@ -460,11 +460,15 @@ impl QBodyHandler {
 
                 tracing::info!(tool = %name, "q-body executing tool");
                 let result = crate::tools::dispatch(&name, &args).await;
+                // no-op fail-loud（issue #146）：动作未发生时显式记日志，不再静默成功形状
+                if result.status == crate::tools::ToolStatus::Failed {
+                    tracing::warn!(tool = %name, "tool action did NOT happen: {}", result.content);
+                }
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": id,
                     "name": name,
-                    "content": result
+                    "content": result.content
                 }));
             }
         }
