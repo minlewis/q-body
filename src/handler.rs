@@ -438,13 +438,19 @@ impl QBodyHandler {
 
             if step == MAX_TOOL_STEPS {
                 let base = last_text.unwrap_or_default();
-                return format!("{base}\n\n⚠️ 已达工具步数上限（{MAX_TOOL_STEPS}），先汇报当前发现。");
+                return format!(
+                    "{base}\n\n⚠️ 已达工具步数上限（{MAX_TOOL_STEPS}），先汇报当前发现。"
+                );
             }
 
             // 把 assistant 的 tool_calls 原样追加，再逐条执行并回喂 tool 结果。
             messages.push(serde_json::json!({"role": "assistant", "tool_calls": calls}));
             for tc in &calls {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call").to_string();
+                let id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("call")
+                    .to_string();
                 let name = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
@@ -538,10 +544,8 @@ impl QBodyHandler {
                                 &full_err,
                             );
                             tracing::error!("{}", full_err);
-                            last_err = Some(format!(
-                                "Sorry, LLM returned error {}: {}",
-                                status, err_msg
-                            ));
+                            last_err =
+                                Some(format!("Sorry, LLM returned error {}: {}", status, err_msg));
                         }
                         Err(e) => {
                             let full_err = format!(
@@ -555,8 +559,7 @@ impl QBodyHandler {
                                 &full_err,
                             );
                             tracing::error!("{}", full_err);
-                            last_err =
-                                Some(format!("Sorry, failed to parse LLM response: {}", e));
+                            last_err = Some(format!("Sorry, failed to parse LLM response: {}", e));
                         }
                     }
                 }

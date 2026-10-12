@@ -221,7 +221,9 @@ async fn main() {
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(&usage::missing_resource_error(&reason))
-                    .unwrap_or_else(|_| "{\"error\":\"missing or unusable resource\",\"exit_code\":1}".into())
+                    .unwrap_or_else(|_| {
+                        "{\"error\":\"missing or unusable resource\",\"exit_code\":1}".into()
+                    })
             );
             std::process::exit(usage::EXIT_MISSING_RESOURCE);
         }
@@ -293,7 +295,9 @@ async fn main() {
                     eprintln!(
                         "{}",
                         serde_json::to_string_pretty(&usage::internal_error(&io_err.to_string()))
-                            .unwrap_or_else(|_| "{\"error\":\"internal error\",\"exit_code\":70}".into())
+                            .unwrap_or_else(
+                                |_| "{\"error\":\"internal error\",\"exit_code\":70}".into()
+                            )
                     );
                     std::process::exit(usage::EXIT_INTERNAL);
                 }

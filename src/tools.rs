@@ -46,7 +46,9 @@ pub fn empty_output_verdict(exit_code: i32) -> String {
     if exit_code == 0 {
         "(命令完成，exit=0，无输出——空结果是合法结果)".to_string()
     } else {
-        format!("(exit={exit_code}，非零退出且无输出——如 grep 无命中属空匹配，其余需结合退出码判断失败)")
+        format!(
+            "(exit={exit_code}，非零退出且无输出——如 grep 无命中属空匹配，其余需结合退出码判断失败)"
+        )
     }
 }
 
@@ -87,16 +89,56 @@ pub fn tool_specs() -> serde_json::Value {
 /// run_readonly 允许的命令前缀（首个可执行词）。
 /// 显式白名单：只放行只读排查工具，写操作一律拒绝。
 const ALLOWED_BINS: &[&str] = &[
-    "systemctl", "journalctl", "ps", "pgrep", "ss", "df", "du", "free", "uptime", "ls", "cat",
-    "head", "tail", "grep", "stat", "who", "date", "hostname", "uname", "id",
+    "systemctl",
+    "journalctl",
+    "ps",
+    "pgrep",
+    "ss",
+    "df",
+    "du",
+    "free",
+    "uptime",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "stat",
+    "who",
+    "date",
+    "hostname",
+    "uname",
+    "id",
 ];
 
 /// run_readonly 即使 bin 合法，也拦截这些明显带写语义的参数/子命令。
 const WRITE_PATTERNS: &[&str] = &[
-    "rm ", "mv ", "cp ", ">", ">>", "&& rm", "mkfs", "dd ", "shutdown", "reboot", "halt",
-    "poweroff", "kill", "killall", "pkill", "chmod", "chown", "mkdir", "touch", "truncate",
-    "systemctl restart", "systemctl stop", "systemctl disable", "systemctl start",
-    "systemctl enable", "systemctl reset-failed",
+    "rm ",
+    "mv ",
+    "cp ",
+    ">",
+    ">>",
+    "&& rm",
+    "mkfs",
+    "dd ",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "kill",
+    "killall",
+    "pkill",
+    "chmod",
+    "chown",
+    "mkdir",
+    "touch",
+    "truncate",
+    "systemctl restart",
+    "systemctl stop",
+    "systemctl disable",
+    "systemctl start",
+    "systemctl enable",
+    "systemctl reset-failed",
 ];
 
 fn first_token(command: &str) -> String {
@@ -124,7 +166,9 @@ fn validate_readonly(command: &str) -> Result<(), String> {
     // systemctl 单独再查子命令（ALLOWED_BINS 有 systemctl，但只准只读子命令）
     for pat in WRITE_PATTERNS {
         if command.contains(pat) {
-            return Err(format!("拒绝执行：检测到写/危险操作片段 `{pat}`。本工具仅允许只读排查。"));
+            return Err(format!(
+                "拒绝执行：检测到写/危险操作片段 `{pat}`。本工具仅允许只读排查。"
+            ));
         }
     }
     // 复用既有 rm-rf 空变量/危险根检测（纵深防御）
@@ -177,10 +221,7 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
 async fn run_shell(command: &str) -> String {
     let cmd = command.to_string();
     let result = timeout(Duration::from_secs(CMD_TIMEOUT_SECS), async move {
-        tokio::task::spawn_blocking(move || {
-            Command::new("bash").arg("-c").arg(&cmd).output()
-        })
-        .await
+        tokio::task::spawn_blocking(move || Command::new("bash").arg("-c").arg(&cmd).output()).await
     })
     .await;
 
@@ -228,7 +269,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_write_even_with_allowed_bin() {
-        let out = dispatch("run_readonly", &json!({"command": "systemctl restart nginx"})).await;
+        let out = dispatch(
+            "run_readonly",
+            &json!({"command": "systemctl restart nginx"}),
+        )
+        .await;
         assert!(out.contains("安全拦截"));
     }
 
@@ -297,7 +342,11 @@ mod tests {
     #[tokio::test]
     async fn grep_no_match_reports_nonzero_exit_honestly() {
         // 端到端失败路径：真实 shell 探针，exit=1 零输出不得含「成功」
-        let out = dispatch("run_readonly", &json!({"command": "grep -c zzzzqqqq /etc/hostname"})).await;
+        let out = dispatch(
+            "run_readonly",
+            &json!({"command": "grep -c zzzzqqqq /etc/hostname"}),
+        )
+        .await;
         assert!(!out.contains("成功"), "got: {out}");
         assert!(out.contains("exit=1"), "got: {out}");
     }
