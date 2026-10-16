@@ -154,6 +154,63 @@ fn first_token(command: &str) -> String {
         .to_string()
 }
 
+/// 路径 provenance 判定（issue #152 同源谓词，两条工具臂共用）。
+///
+/// 借鉴 yoyo #1024（同一谓词挡每一扇门）+ #1023（fail closed 按 provenance
+/// 判定，不按 flag/片段黑名单）：返回 canonicalize 后的绝对路径，仅当
+/// canonical 结果落在 ALLOW_ROOTS 且不触碰本地凭据/私钥/令牌存储时放行。
+/// deny-by-default — 未知路径、凭据目录一律拒绝，绝不因「白名单 bin 合法」
+/// 或「绝对路径不含写片段」放行凭据读取。
+pub fn path_provenance(path: &str) -> Result<std::path::PathBuf, String> {
+    let raw = std::path::Path::new(path);
+    // canonicalize 解析相对路径/符号链接 — 判定永远基于真实落点。
+    let canon = raw
+        .canonicalize()
+        .map_err(|e| format!("路径不可解析（{e}）：{path}"))?;
+
+    // 凭据/私钥/令牌存储 → 无条件拒绝（fail closed 优先）
+    for d in DENY_SUBPATHS {
+        if canon.starts_with(d) {
+            return Err(format!(
+                "拒绝读取凭据/私钥/令牌存储路径：{path}（本地敏感区，不进入模型上下文）"
+            ));
+        }
+    }
+
+    // 允许前缀：canonical 绝对路径必须落在任一系统只读/工作区根内
+    for root in ALLOW_ROOTS {
+        if canon.starts_with(root) {
+            return Ok(canon);
+        }
+    }
+
+    Err(format!(
+        "拒绝读取：{path}（不在允许只读路径内；deny-by-default）"
+    ))
+}
+
+/// 只读读取的允许根（canonicalize 后判断）。系统常规 + q-body 工作区。
+const ALLOW_ROOTS: &[&str] = &[
+    "/etc",
+    "/var",
+    "/usr",
+    "/proc",
+    "/sys",
+    "/tmp",
+    "/home/ubuntu/q-body",
+    "/home/ubuntu/.hermes/skills",
+];
+
+/// 即使路径在允许根内，也无条件拒绝的本地敏感子路径（凭据/私钥/令牌）。
+const DENY_SUBPATHS: &[&str] = &[
+    "/home/ubuntu/.git-credentials",
+    "/home/ubuntu/.ssh",
+    "/home/ubuntu/.config/gh",
+    "/home/ubuntu/.config/tokencost",
+    "/home/ubuntu/.hermes/cron",
+    "/home/ubuntu/.hermes/secrets",
+];
+
 /// 白名单 + 写模式 + rm-rf 安全网三重闸。任一不过即拒绝（不执行）。
 fn validate_readonly(command: &str) -> Result<(), String> {
     let bin = first_token(command);
@@ -187,6 +244,31 @@ fn clamp_output(s: String) -> String {
     }
 }
 
+/// run_readonly 读侧命令的 provenance 闸（#152）。
+///
+/// 对命令做朴素 token 化，取出每个「绝对路径形态」token（以 `/` 开头、
+/// 非 option/非内联赋值），逐个过 `path_provenance`（fail closed：
+/// 任一传递路径落在敏感区/允许域外即整条拒绝，不执行）。
+/// 与 read_file 臂共用同一谓词（yoyo #1024 same predicate 挡每一扇门）。
+pub fn path_provenance_command(command: &str) -> Result<(), String> {
+    for tok in command.split_whitespace() {
+        let tok = tok.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+        if !tok.starts_with('/') || tok.starts_with("--") {
+            continue;
+        }
+        // 内联赋值（VAR=/path）与双 token 间无空格等形态不在此朴素覆盖内；
+        // 只处理最直接的「绝对路径作为参数」这条被探针坐实的逃逸线。
+        if let Err(prov) = path_provenance(tok) {
+            // 特殊：path_provenance 的「不可解析」在命令级视为非路由路径，跳过
+            if prov.starts_with("路径不可解析") {
+                continue;
+            }
+            return Err(prov);
+        }
+    }
+    Ok(())
+}
+
 /// 分发并执行一次工具调用，返回回喂给 LLM 的结果字符串。
 pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
     match name {
@@ -197,12 +279,24 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
             if let Err(rej) = validate_readonly(command) {
                 return format!("⛔ 安全拦截（未执行）：{rej}");
             }
+            // provenance 闸：白名单 bin 合法不够，读侧路径还要过敏感区/允许域校验
+            if let Err(prov) = path_provenance_command(command) {
+                return format!("⛔ 安全拦截（未执行）：{prov}");
+            }
             run_shell(command).await
         }
         "read_file" => {
             let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
                 return "工具错误：缺少 path 参数".to_string();
             };
+            // provenance 闸：read_file 臂与 run_readonly 同一谓词（#1024 同源）
+            // 例外：路径不可解析（不存在）→ 不是凭据路径（凭据必存在），
+            // 放行到正常读，由 #140 三态诚实报告「路径不存在」而非「安全拦截」。
+            if let Err(prov) = path_provenance(path) {
+                if !prov.starts_with("路径不可解析") {
+                    return format!("⛔ 安全拦截（未执行）：{prov}");
+                }
+            }
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => clamp_output(content),
                 // 三态诚实分类（issue #140）：路径不存在 ≠ 不可读，错误消息可区分
@@ -362,5 +456,105 @@ mod tests {
         // 同步小工具直接走 dispatch 会进 async；这里只验证白名单纯函数
         assert!(validate_readonly("rm -rf /").is_err());
         assert!(validate_readonly("uptime").is_ok());
+    }
+
+    // ---- issue #152：provenance 闸（fail closed by provenance，非 flag/片段黑名单）----
+
+    #[test]
+    fn provenance_denies_credentials_file() {
+        // 探针坐实：cat ~/.git-credentials 旧实现 GATE=PASS 读 133B 含 ghp_
+        let e = path_provenance("/home/ubuntu/.git-credentials");
+        assert!(e.is_err(), "凭据文件必须被拒: {e:?}");
+        assert!(e.unwrap_err().contains("凭据/私钥/令牌"));
+    }
+
+    #[test]
+    fn provenance_denies_ssh_dir() {
+        let e = path_provenance("/home/ubuntu/.ssh/q-body_deploy");
+        assert!(e.is_err(), "SSH 私钥必须被拒");
+        assert!(e.unwrap_err().contains("凭据/私钥/令牌"));
+    }
+
+    #[test]
+    fn provenance_denies_gh_config() {
+        // 读侧路径不触碰 ~/.config/gh（含 auth token，deny-by-default）
+        assert!(path_provenance("/home/ubuntu/.config/gh/hosts.yml").is_err());
+    }
+
+    #[test]
+    fn provenance_allows_system_root() {
+        // 合法只读：/etc/hostname canonical 落 /etc 允许根内
+        let p = path_provenance("/etc/hostname").unwrap();
+        assert_eq!(p, std::path::Path::new("/etc/hostname"));
+    }
+
+    #[test]
+    fn provenance_allows_workspace() {
+        // q-body 工作区允许根（含遍历 src/、soul/ 等）
+        let p = path_provenance("/home/ubuntu/q-body/src/tools.rs").unwrap();
+        assert!(p.starts_with("/home/ubuntu/q-body"));
+    }
+
+    #[test]
+    fn provenance_unresolvable_reports_denied_not_lie() {
+        // 不存在的路径 canonicalize 失败 → path_provenance 报错（不是放行）
+        assert!(path_provenance("/nonexistent-xyz-123/file").is_err());
+        // 但 read_file 臂对它放行到 #140 三态（路径不存在），不是安全拦截：
+        // 不存在的路径读不到任何凭据，不属于泄漏面（见 read_file_missing 语义）
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_still_reports_path_missing_not_security() {
+        // 回归守住 #140 三态诚实：不存在的路径报「路径不存在」，不得被误判为安全拦截
+        let out = dispatch("read_file", &json!({"path": "/nonexistent-xyz-123"})).await;
+        assert!(out.contains("路径不存在"), "got: {out}");
+        assert!(!out.contains("安全拦截"), "读了不存在的路径不提安全: {out}");
+    }
+
+    #[tokio::test]
+    async fn read_file_denies_credentials_via_provenance() {
+        // 探针坐实 PATH_GATE=NONE 的逃逸线：read_file 臂读凭据 133B 含 ghp_
+        let out = dispatch("read_file", &json!({"path": "/home/ubuntu/.git-credentials"})).await;
+        assert!(out.contains("安全拦截"), "read_file 必须拦凭据: {out}");
+        assert!(out.contains("凭据"), "got: {out}");
+        assert!(!out.contains("ghp_"), "凭据内容不得泄露进回复: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_readonly_denies_credential_cat() {
+        // 探针坐实：cat ~/.git-credentials 旧实现 GATE=PASS + bash 真拿 133B
+        let out = dispatch(
+            "run_readonly",
+            &json!({"command": "cat /home/ubuntu/.git-credentials"}),
+        )
+        .await;
+        assert!(out.contains("安全拦截"), "run_readonly 必须拦凭据 cat: {out}");
+        assert!(out.contains("凭据"), "got: {out}");
+        assert!(!out.contains("ghp_"), "凭据不得进回复: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_readonly_denies_ssh_head() {
+        // 探针坐实：head -5 ~/.ssh/q-body_deploy 旧实现 GATE=PASS + 私钥 411B
+        let out = dispatch(
+            "run_readonly",
+            &json!({"command": "head -5 /home/ubuntu/.ssh/q-body_deploy"}),
+        )
+        .await;
+        assert!(out.contains("安全拦截"), "必须拦私钥 head: {out}");
+        assert!(out.contains("凭据"), "got: {out}");
+        assert!(!out.contains("PRIVATE KEY"), "私钥不得进回复: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_readonly_allows_system_cat() {
+        // 合法只读不受影响：cat /etc/hostname 仍在允许根内
+        let out = dispatch(
+            "run_readonly",
+            &json!({"command": "cat /etc/hostname"}),
+        )
+        .await;
+        assert!(out.contains("安全拦截") == false, "合法只读被误拦: {out}");
+        assert!(!out.trim().is_empty(), "got: {out}");
     }
 }
