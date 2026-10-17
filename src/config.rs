@@ -212,6 +212,15 @@ impl Default for Config {
     }
 }
 
+/// M3 配置畸形判据（#1036 畸形配置测试化：refuse vs strip vs keep 显式定行为）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum M3ConfigVerdict {
+    /// 配置完好，原样保留
+    Valid,
+    /// 字段级畸形可修复，剥离畸形字段、回落该字段默认值
+    Malformed,
+}
+
 impl Config {
     /// 从文件路径加载配置。如果文件不存在，返回默认配置。
     pub fn from_file(path: &str) -> Self {
@@ -230,5 +239,108 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// 鉴定 M3 配置是否畸形（未显式提供必填字段的语义，而不仅是 toml 语法错误）。
+    ///
+    /// - `api_url` 为空串 / `api_key_env` 为空串 / `max_tokens == 0` 均判畸形。
+    /// - 畸形时调用方应显式 `strip`（回落字段默认值）而非静默继续用空值跑
+    ///   （§22 修复需出勤钩子：把「静默回退」显式化为可判定的三态行为）。
+    pub fn m3_verdict(&self) -> M3ConfigVerdict {
+        if self.m3.api_url.trim().is_empty()
+            || self.m3.api_key_env.trim().is_empty()
+            || self.m3.max_tokens == 0
+        {
+            M3ConfigVerdict::Malformed
+        } else {
+            M3ConfigVerdict::Valid
+        }
+    }
+
+    /// 剥离 M3 配置的畸形字段并回落默认值，返回修复后的自引用。
+    ///
+    /// 语义对齐 yoyo-evolve #1036：「畸形配置 → strip（剥离畸形字段走默认）
+    /// 而非 refuse（整体拒绝启动）——M3 是可选 provider，M3 畸形不应拖垮主路径」。
+    pub fn sanitize_m3(&mut self) {
+        if self.m3.api_url.trim().is_empty() {
+            self.m3.api_url = default_m3_api_url();
+        }
+        if self.m3.api_key_env.trim().is_empty() {
+            self.m3.api_key_env = default_m3_api_key_env();
+        }
+        if self.m3.max_tokens == 0 {
+            self.m3.max_tokens = default_m3_max_tokens();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(mut f: impl FnMut(&mut M3Config)) -> Config {
+        let mut c = Config::default();
+        f(&mut c.m3);
+        c
+    }
+
+    #[test]
+    fn test_default_m3_is_valid() {
+        let c = Config::default();
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
+        assert_eq!(c.m3.api_url, default_m3_api_url());
+        assert_eq!(c.m3.api_key_env, default_m3_api_key_env());
+        assert_eq!(c.m3.max_tokens, default_m3_max_tokens());
+    }
+
+    #[test]
+    fn test_empty_api_url_is_malformed_and_stripped() {
+        let mut c = cfg_with(|m| m.api_url = "".into());
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Malformed);
+        c.sanitize_m3();
+        assert_eq!(c.m3.api_url, default_m3_api_url());
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
+    }
+
+    #[test]
+    fn test_empty_api_key_env_is_malformed_and_stripped() {
+        let mut c = cfg_with(|m| m.api_key_env = "   ".into());
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Malformed);
+        c.sanitize_m3();
+        assert_eq!(c.m3.api_key_env, default_m3_api_key_env());
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
+    }
+
+    #[test]
+    fn test_zero_max_tokens_is_malformed_and_stripped() {
+        let mut c = cfg_with(|m| m.max_tokens = 0);
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Malformed);
+        c.sanitize_m3();
+        assert_eq!(c.m3.max_tokens, default_m3_max_tokens());
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
+    }
+
+    #[test]
+    fn test_partial_malformed_strips_only_bad_fields() {
+        let mut c = cfg_with(|m| {
+            m.api_url = "".into(); // malformed
+            m.model = "MiniMax-M3-Pro".into(); // fine, keep
+            m.max_tokens = 0; // malformed
+        });
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Malformed);
+        c.sanitize_m3();
+        // 只剥畸形字段，完好字段不动
+        assert_eq!(c.m3.api_url, default_m3_api_url());
+        assert_eq!(c.m3.max_tokens, default_m3_max_tokens());
+        assert_eq!(c.m3.model, "MiniMax-M3-Pro");
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
+    }
+
+    #[test]
+    fn test_valid_m3_not_touched_by_sanitize() {
+        let mut c = cfg_with(|m| m.max_tokens = 8192);
+        c.sanitize_m3();
+        assert_eq!(c.m3.max_tokens, 8192); // 有效值不回落
+        assert_eq!(c.m3_verdict(), M3ConfigVerdict::Valid);
     }
 }

@@ -140,6 +140,12 @@ async fn main() {
         format!("{}/.q-body/config.toml", home)
     });
     let mut config = Config::from_file(&config_path);
+    // 畸形 M3 配置显式 strip：剥离空 api_url / 空 api_key_env / max_tokens=0，
+    // 回落默认值（可选 provider 不拖垮主路径），并留 warn 日志（§22 出勤钩子）。
+    if config.m3_verdict() == q_body::config::M3ConfigVerdict::Malformed {
+        tracing::warn!("M3 config has malformed fields (empty api_url / api_key_env / zero max_tokens). Stripping malformed fields to defaults.");
+        config.sanitize_m3();
+    }
 
     // CLI --port 覆盖配置文件中的 port
     if let Some(p) = cli_port {
