@@ -141,6 +141,66 @@ const WRITE_PATTERNS: &[&str] = &[
     "systemctl reset-failed",
 ];
 
+/// ask-once 读栅栏（借鉴 yoyo-evolve #879）：cwd 外 read_file 须一次性授权。
+/// 机器形态 = deny-by-default：只放行 cwd 内路径；cwd 外须显式写入
+/// `QBODY_READ_ALLOW`（逗号分隔目录前缀白名单，声明过=已确认），
+/// 未授权 cwd 外读在触碰文件系统前被拒回。凭据/私钥/系统敏感路径到不了
+/// read_to_string（对齐 yoyo #1023 fail-closed，按 provenance 不按片段黑名单）。
+fn read_path_fence(path: &str) -> Result<(), String> {
+    read_path_fence_inner(path, &std::env::var("QBODY_READ_ALLOW").unwrap_or_default())
+}
+
+/// 纯逻辑判定（可测）。规则：
+///   1. cwd 与 requested 均 canonicalize。
+///   2. requested ∈ cwd（== 或前缀）→ 放行。
+///   3. 否则遍历 allowlist 条目（canonicalize 前缀匹配），命中 → 放行。
+///   4. 全未命中 → Err（cwd 外读未授权，deny-by-default）。
+/// canonicalize 失败（路径不存在）→ 放行交 fs 层诚实报 PathMissing（#140）：
+/// 不存在路径读不出任何数据，无泄露面；存在且脱授权的路径全 canonicalize
+/// 成功 → 必被栅住。
+pub fn read_path_fence_inner(path: &str, allowlist_env: &str) -> Result<(), String> {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return Err(format!("读取栅栏：工作目录不可得，拒绝 `{path}`")),
+    };
+    let requested = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        // 无法归位（不存在/悬空链接）：放行，由 fs 层还 PathMissing 三态真相，
+        // 零数据可泄露，拦它只会吞掉 #140 的诚实分类。
+        Err(_) => return Ok(()),
+    };
+    let cwd_s = cwd.to_string_lossy();
+    let req_s = requested.to_string_lossy();
+    if req_s == cwd_s || req_s.starts_with(&format!("{}{}", cwd_s, std::path::MAIN_SEPARATOR)) {
+        return Ok(()); // 工作目录内，直接放行
+    }
+    // cwd 外：走一次性授权白名单。env 未设置/空 = 未授权 → 拒绝（deny-by-default）
+    if allowlist_env.trim().is_empty() {
+        return Err(format!(
+            "读取栅栏：`{path}` 在工作目录外。须一次性授权——将目录前缀加入 env `QBODY_READ_ALLOW`（逗号分隔）后再读"
+        ));
+    }
+    for entry in allowlist_env.split(',') {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        // "*" 语义：放行所有路径（显式全开，勿在含敏感路径场景使用）
+        if e == "*" {
+            return Ok(());
+        }
+        if let Ok(ep) = std::fs::canonicalize(e) {
+            let ep_s = ep.to_string_lossy();
+            if req_s == ep_s || req_s.starts_with(&format!("{}{}", ep_s, std::path::MAIN_SEPARATOR)) {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "读取栅栏：`{path}` 在工作目录外且未授权。须一次性授权——将目录前缀加入 env `QBODY_READ_ALLOW`（逗号分隔）后再读"
+    ))
+}
+
 fn first_token(command: &str) -> String {
     command
         .trim()
@@ -203,6 +263,11 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
             let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
                 return "工具错误：缺少 path 参数".to_string();
             };
+            // ask-once 读栅栏（#157 借鉴 yoyo #879）：cwd 外读须一次性授权，
+            // deny-by-default——授权名单里的东西先于文件系统触碰被拒回。
+            if let Err(rej) = read_path_fence(path) {
+                return format!("⛔ 读取拦截（未读取）：{rej}");
+            }
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => clamp_output(content),
                 // 三态诚实分类（issue #140）：路径不存在 ≠ 不可读，错误消息可区分
@@ -285,8 +350,18 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_works() {
-        let out = dispatch("read_file", &json!({"path": "/etc/hostname"})).await;
+        // 工作目录内文件直接放行（栅栏对 cwd 内零拦截）
+        let cwd = std::env::current_dir().unwrap();
+        let inpath = cwd.join("Cargo.toml");
+        let out = dispatch("read_file", &json!({"path": inpath.to_string_lossy()})).await;
         assert!(!out.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_works_with_env_fence() {
+        // 默认无 env：cwd 外 /etc 应被栅栏拦截
+        let out = dispatch("read_file", &json!({"path": "/etc/hostname"})).await;
+        assert!(out.contains("读取拦截"), "got: {out}");
     }
 
     #[tokio::test]
@@ -319,7 +394,14 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_directory_says_unreadable() {
-        let out = dispatch("read_file", &json!({"path": "/tmp"})).await;
+        // 用仓库内目录（cwd 内放行过了栅栏）触发 Unreadable：目录存在但读不了
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd.join(".git");
+        if !dir.exists() {
+            eprintln!("skip: no .git dir in cwd");
+            return;
+        }
+        let out = dispatch("read_file", &json!({"path": dir.to_string_lossy()})).await;
         assert!(out.contains("不可读"), "got: {out}");
         assert!(!out.contains("路径不存在"), "got: {out}");
     }
@@ -355,6 +437,55 @@ mod tests {
     fn first_token_strips_path() {
         assert_eq!(first_token("/usr/bin/ls -la"), "ls");
         assert_eq!(first_token("df -h"), "df");
+    }
+
+    // ---- issue #157：ask-once 读栅栏（借鉴 yoyo-evolve #879）----
+
+    #[test]
+    fn fence_denies_cwd_external_without_env() {
+        // cwd 外 + 无 env 授权 → 拒绝（deny-by-default）
+        let r = read_path_fence_inner("/etc/hostname", "");
+        assert!(r.is_err(), "cwd 外读默认必须被拒: {r:?}");
+    }
+
+    #[test]
+    fn fence_allows_cwd_internal() {
+        // cwd 内（仓库 Cargo.toml）→ 放行
+        let cwd = std::env::current_dir().unwrap();
+        let p = cwd.join("Cargo.toml");
+        let r = read_path_fence_inner(&p.to_string_lossy(), "");
+        assert!(r.is_ok(), "cwd 内读必须放行: {r:?}");
+    }
+
+    #[test]
+    fn fence_env_gate_authorizes_dir() {
+        // cwd 外 + env 白名单命中目录 → 放行（一次性授权的机器形态）
+        let r = read_path_fence_inner("/etc/hostname", "/etc");
+        assert!(r.is_ok(), "env 授权目录内必须放行: {r:?}");
+    }
+
+    #[test]
+    fn fence_env_gate_rejects_outside_allowlist() {
+        // cwd 外 + env 白名单不覆盖 → 拒绝
+        let cwd = std::env::current_dir().unwrap();
+        let other = cwd.join("..");
+        // /home/.../.. 归位到 /home —— canonicalize 后必在 cwd 外
+        let r = read_path_fence_inner(&other.to_string_lossy(), "/etc");
+        assert!(r.is_err(), "授权名单外 cwd 外读必须拒: {r:?}");
+    }
+
+    #[test]
+    fn fence_nonexistent_path_passes_to_fs() {
+        // 路径不存在：栅栏放行（零数据可泄露），真相留给 fs 层的 PathMissing
+        let r = read_path_fence_inner("/nonexistent-xyz-123", "");
+        assert!(r.is_ok(), "不存在的路径应放行由 fs 层报缺失: {r:?}");
+    }
+
+    #[test]
+    fn fence_wildcard_env_authorizes_all() {
+        // 显式 "*" env → 全开（显式声明的 escape hatch）
+        let r = read_path_fence_inner("/etc/hostname", "*");
+        assert!(r.is_ok(), "'*' env 必须放行: {r:?}");
     }
 
     #[test]
