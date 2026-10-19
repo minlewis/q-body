@@ -488,9 +488,9 @@ impl QBodyHandler {
         let mut last_err: Option<String> = None;
 
         for provider in LLM_PROVIDERS {
-            let api_key = match std::env::var(provider.api_key_env) {
-                Ok(k) if !k.trim().is_empty() => k,
-                _ => {
+            let api_key = match crate::env_keys::lookup_api_key(provider.api_key_env) {
+                Some(k) => k,
+                None => {
                     tracing::warn!(
                         "LLM provider {} skipped: {} not set",
                         provider.name,

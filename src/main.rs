@@ -31,6 +31,7 @@ mod a2a;
 mod artifact;
 mod clamp;
 mod darkroom;
+mod env_keys;
 mod evolution_gate;
 mod gate_audit;
 mod handler;
