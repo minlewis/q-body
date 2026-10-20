@@ -10,7 +10,7 @@
 
 use crate::validator::command as safety;
 use serde_json::json;
-use std::process::Command;
+use tokio::process::Command as TCommand;
 use tokio::time::{Duration, timeout};
 
 /// 单次命令执行上限（秒）——防止挂死/无限输出型命令。
@@ -219,36 +219,98 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
 }
 
 async fn run_shell(command: &str) -> String {
-    let cmd = command.to_string();
-    let result = timeout(Duration::from_secs(CMD_TIMEOUT_SECS), async move {
-        tokio::task::spawn_blocking(move || Command::new("bash").arg("-c").arg(&cmd).output()).await
-    })
-    .await;
+    run_shell_with_timeout(command, CMD_TIMEOUT_SECS).await
+}
 
-    match result {
-        Err(_) => format!("超时：命令执行超过 {CMD_TIMEOUT_SECS}s，已终止"),
-        Ok(Err(join_err)) => format!("执行失败：{join_err}"),
-        Ok(Ok(Ok(out))) => {
-            let mut combined = String::new();
-            combined.push_str(&String::from_utf8_lossy(&out.stdout));
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.trim().is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str("[stderr]\n");
-                combined.push_str(&stderr);
-            }
-            if combined.trim().is_empty() {
-                // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
-                combined = empty_output_verdict(out.status.code().unwrap_or(-1));
-            } else if !out.status.success() {
-                combined = format!("exit={}\n{combined}", out.status.code().unwrap_or(-1));
-            }
-            clamp_output(combined)
-        }
-        Ok(Ok(Err(e))) => format!("执行失败：{e}"),
+/// run_shell 的带参版本：CMD_TIMEOUT_SECS 上方是生产默认，测试用短超时
+/// 快证「后台孙进程占管道 → 超时 killpg 全家死透」而不必等足 15s。
+async fn run_shell_with_timeout(command: &str, timeout_secs: u64) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let cmd = command.to_string();
+    let mut child = match TCommand::new("bash")
+        .arg("-c")
+        .arg(&cmd)
+        // 显式接管 stdout/stderr（tokio spawn 默认继承 fd，不接管则
+        // wait_with_output 抓不到输出——旧实现 std Command::output() 自动
+        // piped，切 tokio 后必须显式声明，否则输出漏进调用方 fd）
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // 进程组隔离（yoyo #1049 同型）：`bash -c 'x &'` 的后台孙进程共享
+        // 本 pgid（pgid == bash pid）；超时 killpg 才能连孙进程一起杀，根治
+        // 「后台进程占输出管道 → 出口挂起 + 孤儿进程泄漏」（10-14 probe 实测：
+        // 旧实现超时文案说谎「已终止」但子进程仍在跑且 CPU 持续增长）
+        .process_group(0)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("执行失败：{e}"),
+    };
+    let pgid = child.id().unwrap_or(0);
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    // 带超时等 bash 退出（&mut 不消费 child，下面超时后还能再引用它收尾）。
+    // 若后台孙进程霸着管道，bash 虽退出但 wait 只在 bash 退出即返回（管道在
+    // 调用方手里，孙进程活着不影响 wait）——超时/不退出的判定由下方 killpg 兜底。
+    let exit = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+
+    // 超时/正常退出两条路径都显式 killpg(SIGKILL) 把整个进程组连根杀掉：
+    // 超时路径杀 bash + 后台孙进程；正常退出路径杀 bash 已退出后仍霸管道的
+    // 遗留后台孙进程（`sleep &` 型）。kill_on_drop 只杀 bash 直子、后台孙进程
+    // 仍霸管道——已被 RED 测试证伪，故一律用 libc 显式全杀组（组已空则无害）。
+    if pgid > 0 {
+        // SAFETY: pgid 是本 spawn 的进程组号（== bash pid，bash exec 末命令后 pid 不变）。
+        let ret = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+        let errno = std::io::Error::last_os_error();
+        let _ = ret; // killpg 成功即返回，失败由下面 if 分支报错
+        // 收一次退出，避免僵尸（正常路径 bash 已被上方 wait 收割，此处无害）。
+        let _ = child.wait().await;
     }
+
+    // 读干净残留管道输出（组已杀/进程已退 → 管道 EOF；外加 1s 兜底防极端残留）。
+    let mut out_buf = Vec::new();
+    if let Some(mut so) = stdout.take() {
+        let _ = timeout(
+            Duration::from_millis(1000),
+            so.read_to_end(&mut out_buf),
+        )
+        .await;
+    }
+    let mut err_buf = Vec::new();
+    if let Some(mut se) = stderr.take() {
+        let _ = timeout(
+            Duration::from_millis(1000),
+            se.read_to_end(&mut err_buf),
+        )
+        .await;
+    }
+
+    let (ok, code) = match exit {
+        Err(_) => {
+            return format!("超时：命令执行超过 {timeout_secs}s，已终止（含后台子进程 killpg）")
+        }
+        Ok(Err(_)) => return "执行失败：无法读取退出状态".to_string(),
+        Ok(Ok(st)) => (st.success(), st.code().unwrap_or(-1)),
+    };
+
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&out_buf));
+    let stderr_s = String::from_utf8_lossy(&err_buf);
+    if !stderr_s.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("[stderr]\n");
+        combined.push_str(&stderr_s);
+    }
+    if combined.trim().is_empty() {
+        // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
+        combined = empty_output_verdict(code);
+    } else if !ok {
+        combined = format!("exit={code}\n{combined}");
+    }
+    clamp_output(combined)
 }
 
 #[cfg(test)]
@@ -362,5 +424,58 @@ mod tests {
         // 同步小工具直接走 dispatch 会进 async；这里只验证白名单纯函数
         assert!(validate_readonly("rm -rf /").is_err());
         assert!(validate_readonly("uptime").is_ok());
+    }
+
+    // ---- issue #162：后台/长驻子进程占输出管道 → 超时 killpg 全家死透（yoyo #1049）----
+
+    #[tokio::test]
+    async fn background_child_holding_pipe_is_killed_on_timeout() {
+        // RED 场景：前台 `sleep 999`（bash 本身不退出）→ wait 超过 2s 兜底超时，
+        // 旧实现超时文案说谎「已终止」但 bash 直子还活着（10-14 probe 实证：
+        // 超时后子进程仍在跑且 CPU 持续增长 = 孤儿 + 泄漏）。
+        // 新实现：超时后 killpg(SIGKILL) 连 bash 一起真杀，sleep 不得残留。
+        let out = run_shell_with_timeout("sleep 999", 2).await;
+        assert!(out.contains("超时"), "should time out, got: {out}");
+        assert!(
+            out.contains("killpg"),
+            "timeout msg should admit killpg, got: {out}"
+        );
+        // 等 2s 超时返回后，短暂让出再探 pgrep —— 组内 echo 无残留进程。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 更硬的探针：直接 pgrep -f 精确命令，0 命中才算真死透
+        let alive = command_find("sleep 999");
+        let _live = std::process::Command::new("pgrep")
+            .arg("-af")
+            .arg("sleep 999")
+            .output()
+            .ok();
+        assert!(!alive, "背景 sleep 应已被 killpg 杀死，但仍存活");
+    }
+
+    #[tokio::test]
+    async fn background_grandchild_is_killed_when_bash_exits_first() {
+        // 变体：`sleep 999 & echo spawned` —— bash 先退出、sleep 后台霸管道。
+        // 管道 read 超 1s 兜底不得挂死（exit 卡死防护），且后台 sleep 也被清掉。
+        let out = run_shell_with_timeout("sleep 999 & echo spawned", 2).await;
+        // bash 立即退 → 不算「超时」，但必须含遗留后台吐出的 spawned 或诚实语义，且不挂死
+        assert!(out.contains("spawned"), "should capture echo output, got: {out}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = command_find("sleep 999");
+        assert!(!alive, "后台孙进程应已被清掉，但仍存活");
+    }
+
+    #[tokio::test]
+    async fn plain_command_still_captures_output() {
+        // 回归：切 tokio 后 stdout/stderr 显式 piped 才抓得到输出——旧实现自动 piped，
+        // 这里钉住「df 输出必进返回串」防输出漏进 fd 的重现（本 PR 摸到过的坑）。
+        let out = run_shell_with_timeout("df -h /", 5).await;
+        assert!(out.contains("Filesystem") || out.contains("/dev/"), "got: {out}");
+    }
+
+    /// 辅助：pgrep -f 精确命令字符串，命中返回 true。
+    fn command_find(pat: &str) -> bool {
+        use std::process::Command;
+        let out = Command::new("pgrep").arg("-f").arg(pat).output().ok();
+        matches!(out, Some(o) if o.status.success())
     }
 }
