@@ -114,13 +114,15 @@ mod tests {
     use super::*;
 
     fn set_env(v: &str) {
-        // SAFETY: 单线程测试进程内修改自身进程环境变量，无并发读取
+        let _g = crate::test_env_lock::env_lock_guard();
+        // SAFETY: 持全局 env 锁 + 单线程测试进程内修改自身进程环境变量
         unsafe {
             std::env::set_var("QBODY_COST_WARN_USD", v);
         }
     }
 
     fn clear_env() {
+        let _g = crate::test_env_lock::env_lock_guard();
         // SAFETY: 同上
         unsafe {
             std::env::remove_var("QBODY_COST_WARN_USD");
