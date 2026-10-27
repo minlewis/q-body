@@ -53,13 +53,51 @@ impl CostJournal {
     }
 }
 
-/// 定价基准（美元 / 1M tokens）— deepseek-v4-Flash 峰值 cache-miss 保守档，
-/// 对齐官方价目表 2026-08-16 重定价（peak：input $0.44 / output $1.32；
-/// off-peak 减半 $0.22 / $0.66，此处取峰值保守估计）。
-/// 可用环境变量 `QBODY_COST_INPUT_USD_PER_MTOK` / `QBODY_COST_OUTPUT_USD_PER_MTOK`
-/// 覆盖，非法值（≤0 / 非数字）回落默认。
+/// 定价基准（美元 / 1M tokens）— 结构化查表，对齐官方价目表交叉核验。
+///
+/// 官方来源（2026-09-18 核验）：DeepSeek API Docs 官方定价页
+/// https://api-docs.deepseek.com/quick_start/pricing （2026-08-16 重定价后，
+/// 2026-09-10 部分模型再调价，此处取最新核验值）。
+/// 定价按「模型分档」而非单值：q-body 实际使用两个 provider——
+///   链首 ark 走 deepseek-v4-flash（主模型，向后兼容）；
+///   备 deepseek-platform 走 deepseek-chat。
+/// peak cache-miss input / output：
+///   deepseek-v4-flash：$0.44 / $1.32（= 旧硬编码单值，重定价后仍一致）
+///   deepseek-chat    ：$0.30 / $1.20（2026-09-10 版，官方页可回查）
+/// 均取峰值 cache-miss 保守档（off-peak 减半，此处取峰值覆盖最坏情形）。
+///
+/// 环境变量 `QBODY_COST_INPUT_USD_PER_MTOK` / `QBODY_COST_OUTPUT_USD_PER_MTOK`
+/// 仍可覆盖默认档（主模型），非法值（≤0 / 非数字）回落默认。
 pub const DEFAULT_INPUT_USD_PER_MTOK: f64 = 0.44;
 pub const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 1.32;
+
+/// 定价档条目：每 1M tokens 的 input/output 单价（美元，峰值 cache-miss 保守档）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceTier {
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
+}
+
+/// 模型定价查表（交叉核验官方页的 exact arm，来源 URL 见模块 doc）。
+/// key 与 handler.rs LLM_PROVIDERS 的模型名一致。
+const MODEL_PRICE_TIERS: &[(&str, PriceTier)] = &[
+    // deepseek-v4-flash（ark 主 provider，兼默认档）
+    ("deepseek-v4-flash", PriceTier { input_usd_per_mtok: 0.44, output_usd_per_mtok: 1.32 }),
+    // deepseek-chat（deepseek-platform 备 provider）
+    ("deepseek-chat", PriceTier { input_usd_per_mtok: 0.30, output_usd_per_mtok: 1.20 }),
+];
+
+/// 取指定模型的定价档；未知模型 → 回落主模型默认档（保守，不因查表失配漏判超线）。
+pub fn price_tier_for_model(model: &str) -> PriceTier {
+    MODEL_PRICE_TIERS
+        .iter()
+        .find(|(name, _)| *name == model)
+        .map(|(_, t)| *t)
+        .unwrap_or(PriceTier {
+            input_usd_per_mtok: DEFAULT_INPUT_USD_PER_MTOK,
+            output_usd_per_mtok: DEFAULT_OUTPUT_USD_PER_MTOK,
+        })
+}
 
 /// 读取单价：env 合法值优先，非法（≤0 / 非数字）或未设置回落默认
 fn price_per_mtok(env_key: &str, default_usd: f64) -> f64 {
@@ -87,12 +125,39 @@ pub fn output_price_usd_per_mtok() -> f64 {
     )
 }
 
-/// 由 usage tokens 估算单次调用成本（美元）。
+/// 由 usage tokens 估算单次调用成本（美元，默认主模型 deepseek-v4-flash 档）。
 ///
 /// 定价基准见 [`DEFAULT_INPUT_USD_PER_MTOK`]（估算只用于超线判定，不作为计费依据）。
 pub fn estimate_cost_usd(input_tokens: u64, output_tokens: u64) -> f64 {
-    input_tokens as f64 * input_price_usd_per_mtok() / 1_000_000.0
-        + output_tokens as f64 * output_price_usd_per_mtok() / 1_000_000.0
+    estimate_cost_usd_for_model("deepseek-v4-flash", input_tokens, output_tokens)
+}
+
+/// 按模型定价档估算成本（美元）。model 查表（[`price_tier_for_model`]），
+/// 未知模型回落主模型默认档。环境变量 override 只作用于主模型默认档（env 语义不变）。
+pub fn estimate_cost_usd_for_model(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+    // 注意：env override （QBODY_COST_*_USD_PER_MTOK）只覆盖主模型默认档——
+    // 未显式 override 时查表各模型价格独立，override 后以 env 为准（保守，用于运维调价）。
+    let tier = price_tier_for_model(model);
+    let input_price = if env_price_override("QBODY_COST_INPUT_USD_PER_MTOK").is_none() {
+        tier.input_usd_per_mtok
+    } else {
+        input_price_usd_per_mtok()
+    };
+    let output_price = if env_price_override("QBODY_COST_OUTPUT_USD_PER_MTOK").is_none() {
+        tier.output_usd_per_mtok
+    } else {
+        output_price_usd_per_mtok()
+    };
+    input_tokens as f64 * input_price / 1_000_000.0
+        + output_tokens as f64 * output_price / 1_000_000.0
+}
+
+/// 读取 env 定价覆盖（None = 未设置或非法；Some = 合法覆盖值）
+fn env_price_override(env_key: &str) -> Option<f64> {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
 }
 
 /// 判定是否超线并构造事件；未超线 / 门控关闭 → None
@@ -242,5 +307,40 @@ mod tests {
         assert_eq!(evs.len(), 3);
         assert_eq!(evs[0].source, "s0");
         assert_eq!(evs[2].source, "s2");
+    }
+
+    #[test]
+    fn test_price_tier_lookup_exact_arm() {
+        // 交叉核验官方价目表 2026-09-10（峰值 cache-miss 档，来源 URL 见模块 doc）：
+        //   deepseek-v4-flash：input $0.44 / output $1.32
+        //   deepseek-chat    ：input $0.30 / output $1.20
+        let flash = price_tier_for_model("deepseek-v4-flash");
+        assert!((flash.input_usd_per_mtok - 0.44).abs() < 1e-9);
+        assert!((flash.output_usd_per_mtok - 1.32).abs() < 1e-9);
+
+        let chat = price_tier_for_model("deepseek-chat");
+        assert!((chat.input_usd_per_mtok - 0.30).abs() < 1e-9);
+        assert!((chat.output_usd_per_mtok - 1.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_price_tier_unknown_model_falls_back() {
+        // 未知模型回落主模型默认档（保守，不因查表失配漏判超线）
+        let unknown = price_tier_for_model("no-such-model");
+        assert_eq!(unknown.input_usd_per_mtok, DEFAULT_INPUT_USD_PER_MTOK);
+        assert_eq!(unknown.output_usd_per_mtok, DEFAULT_OUTPUT_USD_PER_MTOK);
+    }
+
+    #[test]
+    fn test_estimate_model_aware() {
+        // 默认无 env override：estimate_cost_usd 走主模型 deepseek-v4-flash 档
+        assert!((estimate_cost_usd(1_000_000, 0) - 0.44).abs() < 1e-9);
+        assert!((estimate_cost_usd(0, 1_000_000) - 1.32).abs() < 1e-9);
+        // deepseek-chat 档：input $0.30 / output $1.20
+        let chat = estimate_cost_usd_for_model("deepseek-chat", 1_000_000, 1_000_000);
+        assert!((chat - 0.30 - 1.20).abs() < 1e-9);
+        // 未知模型回落默认档
+        let unknown = estimate_cost_usd_for_model("nope", 1_000_000, 1_000_000);
+        assert!((unknown - 0.44 - 1.32).abs() < 1e-9);
     }
 }
