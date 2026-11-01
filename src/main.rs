@@ -158,12 +158,15 @@ async fn main() {
     // 结构化分类（#982 同款）：未知/非法参数不再静默吞掉——每次出现都产生
     // 分类条目，Unknown/InvalidValue 类错误直接非零退出并打结构化 error body
     // （golden 字节级钉死），杜绝「非法输入静默回退默认端口」的自 concealing。
+    // Positional（`--` 后内容）为合法旁观值，不触发错误。
     let arg_strings: Vec<String> = std::env::args().skip(1).collect();
     let (port, outcomes) = usage::resolve_port(&arg_strings);
-    if outcomes
-        .iter()
-        .any(|o| !matches!(o, usage::PortOutcome::Parsed(_)))
-    {
+    if outcomes.iter().any(|o| {
+        matches!(
+            o,
+            usage::PortOutcome::Unknown(_) | usage::PortOutcome::InvalidValue(_)
+        )
+    }) {
         let err = usage::cli_error(&arg_strings, &outcomes);
         eprintln!(
             "{}",
