@@ -25,9 +25,34 @@ const USER_CANCELLATION_PATTERNS: &[&str] = &[
 /// 判定 LLM HTTP 错误是否为用户主动取消（而非真实网络失败）。
 ///
 /// 取消 → 不记 failure 事件、不触发 failover；真实失败 → 原链路。
+///
+/// #1126 校准（2026-11-04）：真实 reqwest 错误是 source 链——display 层
+/// `e.to_string()` 只给 "error sending request for url (...)"，关键判别文本
+/// （"dns error" / "operation canceled" 等）可能只在 source 链深处。只匹配
+/// display 层会让取消判别依赖"猜测版表层"，与真实系统报错脱节（yoyo #1126
+/// 的 matcher 匹配 'dns resolution failed' 而真实文本是 'dns error' 同型）。
+/// 因此把整个 source 链拼成全文再判定，词表不变、判定域扩大。
 pub fn is_user_cancellation(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     USER_CANCELLATION_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// 拼接一条 `std::error::Error` 的完整 source 链文本（display + 逐层 source）。
+///
+/// 真实 reqwest/hyper 错误的判别文本常只出现在 source 链深处，display 层
+/// （`e.to_string()`）拿不到——这正是 yoyo #1126 的教训。调用方应把 `&e`
+/// 经本函数展开后喂给 `is_user_cancellation` / 日志 / 诊断，而非裸 `e.to_string()`。
+pub fn error_chain_text(e: &dyn std::error::Error) -> String {
+    let mut out = String::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(c) = cur {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&c.to_string());
+        cur = c.source();
+    }
+    out
 }
 
 /// LLM 解析失败事件的类型
@@ -219,5 +244,81 @@ mod tests {
         ];
         assert!(!kinds.contains(&"canceled"));
         assert!(!kinds.contains(&"cancelled"));
+    }
+
+    // === error_chain_text：展开 source 链，锚定真实系统报错全文（yoyo #1126 校准）===
+    // 构造一个多层 source 错误模拟 reqwest 真实错误：
+    //   display: "error sending request for url (...)"
+    //   source:  "client error (Connect)"
+    //   source:  "dns error"
+    // 关键判别文本 "dns error" 只在链深处，display 层拿不到。
+    #[derive(Debug)]
+    struct ChainErr(&'static str, Option<Box<dyn std::error::Error>>);
+    impl std::fmt::Display for ChainErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+    impl std::error::Error for ChainErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref()
+        }
+    }
+
+    fn make_chain() -> ChainErr {
+        ChainErr(
+            "error sending request for url (https://x.invalid/)",
+            Some(Box::new(ChainErr(
+                "client error (Connect)",
+                Some(Box::new(ChainErr("dns error", None))),
+            ))),
+        )
+    }
+
+    #[test]
+    fn test_error_chain_text_contains_all_layers() {
+        let e = make_chain();
+        let chain = error_chain_text(&e);
+        // 三层全在拼接全文里
+        assert!(chain.contains("error sending request for url"));
+        assert!(chain.contains("client error (Connect)"));
+        assert!(chain.contains("dns error"), "source 链深处文本必须可见: {chain}");
+    }
+
+    #[test]
+    fn test_display_only_misses_source_depth() {
+        // 关键判别文本只在 source 链深处——display 层判定会漏（#1126 教训）
+        let e = make_chain();
+        let display = format!("{e}");
+        assert!(!display.contains("dns error"), "display 层不含深层文本: {display}");
+        let chain = error_chain_text(&e);
+        assert!(chain.contains("dns error"));
+    }
+
+    #[test]
+    fn test_cancellation_marker_in_deep_source_is_detected() {
+        // 取消标记只出现在 source 链深处（display 层没有）——展开 source 链后
+        // is_user_cancellation 命中；只匹配 display（e.to_string()）会漏判（#1126 教训）。
+        // 词表保持 #855 窄语义："operation cancelled" 是关键判别短语。
+        let display_only = "error sending request for url (https://x.invalid/)";
+        let marker = error_chain_text(&ChainErr(
+            display_only,
+            Some(Box::new(ChainErr(
+                "the request was cancelled before completion, reported as: operation cancelled",
+                None,
+            ))),
+        ));
+        // display 层不含判别短语
+        assert!(!display_only.to_ascii_lowercase().contains("operation cancelled"));
+        // 展开 source 链后命中
+        assert!(is_user_cancellation(&marker));
+    }
+
+    #[test]
+    fn test_real_dns_failure_not_cancelled_even_in_chain() {
+        // 真实 DNS 失败展开全链后仍不是取消（不误燃）——词表不变，判定域扩大而非误伤
+        let e = make_chain();
+        let chain = error_chain_text(&e);
+        assert!(!is_user_cancellation(&chain), "DNS 失败不是取消: {chain}");
     }
 }
