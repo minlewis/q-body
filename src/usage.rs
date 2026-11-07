@@ -35,6 +35,8 @@ pub enum PortOutcome {
     InvalidValue(String),
     /// 未知参数 — 回退默认但必须可观测
     Unknown(String),
+    /// end-of-options（`--`）标记或其后的 positional 参数 — 不触发错误
+    Positional(String),
 }
 
 pub const DEFAULT_PORT: u16 = 41242;
@@ -55,12 +57,31 @@ pub fn parse_arg(arg: &str) -> PortOutcome {
     PortOutcome::Unknown(arg.to_string())
 }
 
+/// POSIX end-of-options 标记：其后的所有参数归为 Positional，不再进 flag
+/// 扫描（哪怕形似 `--port=...` 也不触发 Unknown/InvalidValue）。当前 q-body
+/// 无 positional 形参消费，故 `--` 后内容为合法旁观值，不产生错误——这是
+/// 与「未知 flag 硬报错」同源的标准语义（yoyo #1111/#1112：`--` 后停扫 flag）。
+pub const END_OF_OPTIONS: &str = "--";
+
 /// 解析整组参数的最终端口（对应 main.rs 循环收敛语义：后者覆盖前者，
-/// 非法/未知项不中断循环，最终落默认或最后一个合法值）。
+/// 非法/未知项不中断循环，最终落默认或最后一个合法值——但见 `--` 即切换
+/// end-of-options 模式，其后的参数全部标 Positional 且不再收敛端口）。
 pub fn resolve_port(args: &[String]) -> (u16, Vec<PortOutcome>) {
     let mut port = DEFAULT_PORT;
     let mut outcomes = Vec::new();
+    // end-of-options 态：见 `--` 置位后，其后所有参数归 Positional（不再
+    // 进 flag 扫描、不触发 Unknown/InvalidValue、不收敛端口）。
+    let mut end_of_options = false;
     for a in args {
+        if !end_of_options && a == END_OF_OPTIONS {
+            end_of_options = true;
+            outcomes.push(PortOutcome::Positional(a.clone()));
+            continue;
+        }
+        if end_of_options {
+            outcomes.push(PortOutcome::Positional(a.clone()));
+            continue;
+        }
         let o = parse_arg(a);
         if let PortOutcome::Parsed(n) = o.clone() {
             // 分离形式 "--port" 钉在默认值（生产现状），不覆盖
@@ -114,6 +135,7 @@ pub fn cli_error(_args: &[String], outcomes: &[PortOutcome]) -> CliError {
             }
             PortOutcome::Unknown(a) => rejected.push(a.clone()),
             PortOutcome::Parsed(_) => {}
+            PortOutcome::Positional(_) => {}
         }
     }
     let error = if invalid_value {
@@ -272,6 +294,50 @@ mod tests {
         let (port, outcomes) = resolve_port(&[]);
         assert_eq!(port, DEFAULT_PORT);
         assert!(outcomes.is_empty());
+    }
+
+    // ---- end-of-options（`--`）：其后停扫 flag（yoyo #1111/#1112）----
+
+    #[test]
+    fn test_resolve_end_of_options_stops_flag_scan() {
+        // `--` 之后跟形似 flag 的参数，不再触发 Unknown 错误、不收敛端口
+        let args: Vec<String> = ["--", "--verbose", "--port=9999", "-x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (port, outcomes) = resolve_port(&args);
+        assert_eq!(port, DEFAULT_PORT); // `--` 前无 --port= 显式赋值
+        assert_eq!(outcomes.len(), 4);
+        // 全部归 Positional，无一触发 Unknown/InvalidValue
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, PortOutcome::Positional(_))));
+    }
+
+    #[test]
+    fn test_resolve_end_of_options_port_before_still_applies() {
+        // `--` 之前解析到的端口仍生效（端到端选项只切后续，不回头）
+        let args: Vec<String> = ["--port=5555", "--", "--port=7777"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (port, outcomes) = resolve_port(&args);
+        assert_eq!(port, 5555); // `--` 后 --port=7777 不再收敛
+        assert!(matches!(outcomes[0], PortOutcome::Parsed(5555)));
+        assert!(matches!(outcomes[1], PortOutcome::Positional(_)));
+        assert!(matches!(outcomes[2], PortOutcome::Positional(_)));
+    }
+
+    #[test]
+    fn test_end_of_options_after_positional_no_error() {
+        // `-- --port=abc`（非法值在 `--` 后）应归 Positional，不触发 InvalidValue
+        let args: Vec<String> = ["--", "--port=abc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_, outcomes) = resolve_port(&args);
+        let e = cli_error(&args, &outcomes);
+        assert!(e.rejected_args.is_empty()); // 无 Unknown/InvalidValue，拒绝列表为空
     }
 
     // ---- CLI 错误路径：结构化 body + 非零退出码（#982 slice 1 同款）----
