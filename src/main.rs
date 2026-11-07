@@ -38,6 +38,9 @@ mod health;
 mod queue;
 pub mod reflect;
 mod state;
+// 测试专用：进程级 env 互斥锁（09-16 竞态判例的共享设施）
+#[cfg(test)]
+mod test_env_lock;
 mod tools;
 mod trust_input;
 mod usage;
