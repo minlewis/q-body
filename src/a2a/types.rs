@@ -160,6 +160,7 @@ pub struct Artifact {
 
 /// 发送消息请求（对应 A2A 的 SendMessage）
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
     pub message: Message,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +192,7 @@ impl SendMessageResponse {
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetTaskRequest {
     pub id: String,
 }

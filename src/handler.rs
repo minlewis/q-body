@@ -129,6 +129,18 @@ impl QBodyHandler {
             .unwrap();
         };
 
+        // 未知参数直接拒绝（借鉴 yoyo-evolve #1111 fail-fast），不静默忽略
+        if let Some(Err(e)) = crate::params::reject_unknown_keys(
+            &p,
+            &["signal", "source", "suggestion", "action", "verification"],
+        ) {
+            return serde_json::to_value(JsonRpcError::invalid_params(
+                request_id,
+                &e.to_string(),
+            ))
+            .unwrap();
+        }
+
         let signal = match p
             .get("signal")
             .and_then(|s| s.as_str())
@@ -220,6 +232,19 @@ impl QBodyHandler {
             .as_ref()
             .and_then(|p| p.get("threshold"))
             .and_then(|t| t.as_f64());
+
+        // 未知参数直接拒绝（借鉴 yoyo-evolve #1111 fail-fast），不静默忽略
+        if let Some(params) = params.as_ref() {
+            if let Some(Err(e)) =
+                crate::params::reject_unknown_keys(params, &["text", "threshold"])
+            {
+                return serde_json::to_value(JsonRpcError::invalid_params(
+                    request_id,
+                    &e.to_string(),
+                ))
+                .unwrap();
+            }
+        }
 
         let Some(text) = text else {
             return serde_json::to_value(JsonRpcError::invalid_params(
@@ -860,6 +885,40 @@ mod transport_scope_tests {
         let out = tokio_test_block(h.handle_request("SendMessage", None, serde_json::json!(1)));
         let msg = out["error"]["message"].as_str().unwrap_or_default();
         assert!(!msg.contains("internal-only"), "scope gate leaked: {out}");
+    }
+
+    #[test]
+    fn test_get_task_rejects_unknown_field() {
+        // siloed：GetTask 经 A2A 通道 + 未知字段 `extra` → deny_unknown_fields 拒绝
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = tokio_test_block(h.handle_request(
+            "GetTask",
+            Some(serde_json::json!({"id": "abc", "extra": 1})),
+            serde_json::json!(9),
+        ));
+        assert_eq!(out["error"]["code"].as_i64(), Some(-32602), "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid GetTask params"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_get_task_accepted_without_extra() {
+        // 正路径：不带未知字段的合法 params 不受影响（task miss 是另一层语义）
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = tokio_test_block(h.handle_request(
+            "GetTask",
+            Some(serde_json::json!({"id": "abc"})),
+            serde_json::json!(10),
+        ));
+        // 未命中任务返回的是 valid_params 语义下的 task-not-found，不是 invalid_params
+        assert_eq!(out["error"]["code"].as_i64(), Some(-32602), "{out}");
+        let msg = out["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("task not found"), "{out}");
     }
 
     /// 单线程阻塞执行 async handler（测试内无 tokio runtime）
