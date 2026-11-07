@@ -89,6 +89,17 @@ pub fn usage_text() -> String {
 // CLI 错误路径：结构化 error body + 非零退出码（#982 slice 1 同款）
 // ============================================================
 
+/// 错误路径的 usage 输出（Day223 Task 1 同款：打印 usage 的同时非零退出）。
+/// 在结构化 error body 之后打印，帮助用户看到合法用法；exit_code 行来自
+/// 语义退出码词表（单一事实源），render 处不做硬编码。
+pub fn usage_with_exit_hint(exit_code: i32) -> String {
+    format!(
+        "{}\n  exit_code={} (non-zero on error)",
+        usage_text(),
+        exit_code
+    )
+}
+
 /// 非法参数时的非零退出码。2 = 使用错误（区别于运行时失败的 1）。
 pub const EXIT_USAGE: i32 = 2;
 
@@ -338,6 +349,41 @@ mod tests {
     fn test_exit_usage_is_nonzero() {
         assert!(EXIT_USAGE > 0);
         assert_ne!(EXIT_USAGE, 1); // 与运行时失败退出码区分
+    }
+
+    // ---- Day223 Task 1：usage 与非零退出码同次输出 ----
+
+    #[test]
+    fn golden_usage_with_exit_hint() {
+        let hint = usage_with_exit_hint(EXIT_USAGE);
+        // usage 块完整包含（合法用法先行可见）
+        assert!(hint.contains(usage_text().as_str()));
+        // exit_code 行存在且值来自退出码词表
+        assert!(hint.contains("exit_code=2"));
+        assert!(hint.contains("non-zero on error"));
+    }
+
+    #[test]
+    fn test_all_cli_error_branches_exit_nonzero() {
+        // Day223 Task 1 断言：坏参/缺参错误体退出码必须非 0
+        let cases: Vec<Vec<String>> = vec![
+            vec!["--verbose".to_string()],               // unknown argument
+            vec!["--port=abc".to_string()],              // invalid value
+            vec!["--port=abc".into(), "--trace".into()], // 混合（invalid value 优先诊断）
+        ];
+        for args in cases {
+            let (_, outcomes) = resolve_port(&args);
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| !matches!(o, PortOutcome::Parsed(_))),
+                "args {:?} should produce a rejected outcome",
+                args
+            );
+            let e = cli_error(&args, &outcomes);
+            assert_ne!(e.exit_code, 0, "args {:?} must exit non-zero", args);
+            assert_eq!(e.exit_code, EXIT_USAGE);
+        }
     }
 
     // ---- 语义退出码词表（#982 slice 2）：cron 管道可区分失败类型 ----
