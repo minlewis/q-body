@@ -135,6 +135,49 @@ fn is_var_set(name: &str) -> bool {
     env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// 间接展开归一化：把「赋值前缀 + 变量间接引用」与「eval 引号拼接」
+/// 归一化为等价的字面 token 流，供词法扫描判定。
+///
+/// 借鉴 yologdev/yoyo-evolve Day 225 Task 2 —— 攻击者视角逆向探针
+/// 证明 `X=rm; $X -rf ~` / `BASH_ARGV0=rm; $BASH_ARGV0 -rf ~` /
+/// `eval "r""m -rf ~"` 三类间接执行能让 rm 从词法上隐身。
+/// 归一化两步：
+///   1. 去引号字符：`"r""m` → `rm`（引号拼接语义的保守近似）
+///   2. 段内赋值前缀收集 + `$VAR`/`${VAR}` 回代：`X=rm; $X ...` → `rm ...`
+/// 注意：回代只注入本命令显式赋过的值，方向偏保守（宁可误报不放行）；
+/// bash 的前缀赋值瞬态语义（`FOO=bar baz; cmd $FOO` 中 FOO 未定义）
+/// 在此被过近似为持续可见——对安全扫描是安全方向的偏差。
+pub fn normalize_indirect_expansion(cmd: &str) -> String {
+    // 1) 去引号字符（拼接语义近似：相邻引号段拼回一个词）
+    let s: String = cmd.chars().filter(|c| *c != '"' && *c != '\'').collect();
+
+    // 2) 按段收集赋值前缀，剩余部分组成待扫描命令
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    let mut rest_parts: Vec<&str> = Vec::new();
+    for seg in s.split(';') {
+        let t = seg.trim();
+        if let Some(eq) = t.find('=') {
+            let name = t[..eq].trim();
+            if is_valid_var_name(name) {
+                assignments.push((name.to_string(), t[eq + 1..].trim().to_string()));
+                continue;
+            }
+        }
+        rest_parts.push(seg);
+    }
+    let rest = rest_parts.join(";");
+    if assignments.is_empty() {
+        return rest;
+    }
+    // 3) 回代：$VAR / ${VAR} → 已记录赋值（长形式优先，防 ${X}y 被短形式误吃）
+    let mut out = rest;
+    for (name, value) in &assignments {
+        out = out.replace(&format!("${{{}}}", name), value.as_str());
+        out = out.replace(&format!("${}", name), value.as_str());
+    }
+    out
+}
+
 /// 生成使用 `${VAR:?}` 的安全替换建议
 fn safe_suggestion(cmd: &str, var: &str) -> String {
     cmd.replace(&format!("${}", var), &format!("${{{}:?}}", var))
@@ -168,16 +211,20 @@ fn check_dangerous_target(cmd: &str) -> Option<String> {
 /// 若是 rm -rf 且含未定义/空变量 → Err(UnresolvedVariable)
 /// 若是 rm -rf 且目标是根路径 → Err(DangerousTarget)
 pub fn scan_rm_command(cmd: &str) -> Result<(), SafetyError> {
-    if !has_rm_rf(cmd) {
+    // 归一化：间接执行（赋值前缀 + $VAR 回代、eval 引号拼接）先展开成
+    // 等价字面 token 流再判定——攻击者视角对抗测试（Day 225 Task 2）证明
+    // 不归一化时 `X=rm; $X -rf ~` 类命令能让 rm 从词法上隐身。
+    let normalized = normalize_indirect_expansion(cmd);
+    if !has_rm_rf(&normalized) {
         return Ok(());
     }
-    if let Some(path) = check_dangerous_target(cmd) {
+    if let Some(path) = check_dangerous_target(&normalized) {
         return Err(SafetyError::DangerousTarget {
             path,
             command: cmd.to_string(),
         });
     }
-    for var in extract_variables(cmd) {
+    for var in extract_variables(&normalized) {
         if !is_var_set(&var) {
             return Err(SafetyError::UnresolvedVariable {
                 suggestion: safe_suggestion(cmd, &var),
@@ -272,6 +319,64 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("Q_BODY_NONEXISTENT_XYZ"));
         assert!(msg.contains(":?"));
+    }
+
+    // ── 对抗测试：间接执行绕过（RED-first，攻击者视角 SOUL §25） ──
+    // 借鉴 yologdev/yoyo-evolve Day 225 Task 2 — 逆向探针 bash 护栏的
+    // 变量间接绕过 → q-body 命令白名单的三类间接执行对抗测试：
+    //   1. 变量间接执行：`X=rm; $X -rf ~`
+    //   2. BASH_ARGV0 间接：`BASH_ARGV0=rm; $BASH_ARGV0 -rf ~`
+    //   3. eval + 引号拼接：`eval "r""m -rf ~"`
+    // 三者在真实 bash 中均等价 `rm -rf ~`（家目录级爆炸半径），
+    // 但词法上无字面 "rm" token。判决：归一化后必须与等价字面命令同判。
+
+    #[test]
+    fn test_scan_indirect_dangerous_target_rejected() {
+        for cmd in [
+            "X=rm; $X -rf ~",
+            "BASH_ARGV0=rm; $BASH_ARGV0 -rf ~",
+            "eval \"r\"\"m -rf ~\"",
+            "eval 'r'm' -rf ~'",
+        ] {
+            let r = scan_rm_command(cmd);
+            assert!(
+                matches!(r, Err(SafetyError::DangerousTarget { .. })),
+                "indirect `{}` must be judged like literal `rm -rf ~`, got {:?}",
+                cmd,
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_indirect_unresolved_var_rejected() {
+        // 间接执行的 rm 携带未定义变量：暴露为 rm -rf $UNSET/x → 拒绝
+        let r = scan_rm_command("X=rm; $X -rf $Q_BODY_NONEXISTENT_IND/x");
+        assert!(matches!(r, Err(SafetyError::UnresolvedVariable { .. })));
+    }
+
+    #[test]
+    fn test_scan_indirect_benign_still_ok() {
+        // 良性间接执行不误伤：判决与等价字面命令一致（rm -rf 普通路径 = Ok）
+        assert!(scan_rm_command("X=rm; $X -rf /tmp/ok-target").is_ok());
+        assert!(scan_rm_command("X=echo; $X hello").is_ok());
+        assert!(scan_rm_command("eval \"e\"\"cho hi\"").is_ok());
+    }
+
+    #[test]
+    fn test_adversarial_indirection_is_real_in_bash() {
+        // 攻击者视角真实性探针：证明 `$X` 间接执行在真实 bash 中
+        // 以 rm 本体语义运行（用 --version 代理删除，验证展开目标）
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("X=rm; $X --version 2>/dev/null | head -1")
+            .output()
+            .expect("bash unavailable");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("rm"),
+            "indirect $X must execute rm itself, got {:?}",
+            out.stdout
+        );
     }
 
     // ── 边界用例：trailing whitespace / 空参 / 多余空格 ──
