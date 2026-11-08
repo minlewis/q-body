@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 mod a2a;
 mod artifact;
 mod clamp;
+mod config_shadow;
 mod darkroom;
 mod evolution_gate;
 mod gate_audit;
@@ -171,6 +172,14 @@ async fn main() {
                 .unwrap_or_else(|_| format!("{{\"error\":\"{}\",\"exit_code\":2}}", err.error))
         );
         std::process::exit(err.exit_code);
+    }
+
+    // 配置遮蔽启动审计（借鉴 yoyo-evolve `config get` 命名被遮蔽的配置
+    // 文件 → q-body 对齐 SOUL §22 自愈核验）：scan 已知可遮蔽配置键，
+    // 「用户显式设置了但值非法/空、被静默回落默认或跳过」的项一次性
+    // 点名打 stderr 警告，防静默回退（§25 自 concealing 盲区可见化）。
+    for issue in config_shadow::audit_config_shadows() {
+        eprintln!("{}", config_shadow::warn_line(&issue));
     }
 
     // 构建 Agent Card
