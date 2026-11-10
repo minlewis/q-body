@@ -49,6 +49,34 @@ const LLM_PROVIDERS: &[LlmProvider] = &[
     },
 ];
 
+/// 启动 fail-loud 校验：为链上每个 provider 断言「其 key 环境变量绑定正确端点」，
+/// 密钥不得发给非匹配 provider（借鉴 yoyo #1170 停止向非 Anthropic provider 发
+/// ANTHROPIC_API_KEY）。全部 `Known`/`Unbound`（保守放行） → Ok；
+/// 任一 `Mismatched`/`WrongKey` → Err(诊断列表)，调用方启动即非零退出，
+/// 杜绝密钥错发（yoyo #982 fail-closed 按 provenance 判定）。
+pub(crate) fn validate_provider_key_bindings() -> Result<(), Vec<String>> {
+    let mut violations = Vec::new();
+    for p in LLM_PROVIDERS {
+        use crate::provider_bind::BindVerdict;
+        match crate::provider_bind::bind_verdict(p.api_key_env, p.api_url) {
+            BindVerdict::Known | BindVerdict::Unbound => {}
+            BindVerdict::Mismatched(owner) => violations.push(format!(
+                "provider '{}': key env '{}' bound to endpoint {} but that host belongs to '{}' — key would go to wrong provider",
+                p.name, p.api_key_env, p.api_url, owner
+            )),
+            BindVerdict::WrongKey(owner) => violations.push(format!(
+                "provider '{}': unknown key env '{}' pointing at '{}' (belongs to '{}') — likely typo",
+                p.name, p.api_key_env, p.api_url, owner
+            )),
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 /// 出站错误消息的 trust-boundary 泄漏模式（借鉴 yoyo-evolve #873 sanitize 审计）
 const LEAK_PATTERNS: &[&str] = &[
     "api/plan/",      // 内部 LLM 端点路径
@@ -755,6 +783,15 @@ mod failover_tests {
             assert!(!p.model.is_empty());
             assert!(!p.api_url.is_empty());
         }
+    }
+
+    #[test]
+    fn test_provider_key_bindings_pass_for_current_chain() {
+        // 现行链（ark + deepseek）的 key↔host 绑定必须全通过，否则启动即 fail-closed。
+        assert!(
+            validate_provider_key_bindings().is_ok(),
+            "current LLM_PROVIDERS must pass provider-key binding check"
+        );
     }
 }
 

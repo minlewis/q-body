@@ -51,6 +51,7 @@ mod webui;
 // ============================================================
 mod backlog;
 mod journal;
+mod provider_bind;
 
 use a2a::types::*;
 use handler::QBodyHandler;
@@ -236,6 +237,26 @@ async fn main() {
         handler,
         started_at: std::time::SystemTime::now(),
     });
+
+    // provider↔key 绑定 fail-loud 校验（yoyo #1170/#982 按 provenance fail-closed）：
+    // 链上任一 provider 的 key 环境变量绑到非匹配端点即启动非零退出，
+    // 密钥绝不发给错误方（诊断列表点名，密钥本身不进日志）。
+    if let Err(violations) = handler::validate_provider_key_bindings() {
+        for v in &violations {
+            tracing::error!("provider-key binding violation: {v}");
+            eprintln!("{v}");
+        }
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&usage::internal_error(&format!(
+                "provider-key binding failed ({} violation(s))",
+                violations.len()
+            )))
+            .unwrap_or_else(|_| "{\"error\":\"provider-key binding failed\",\"exit_code\":70}"
+                .into())
+        );
+        std::process::exit(usage::EXIT_INTERNAL);
+    }
 
     // CORS —— 允许跨域调用
     let cors = CorsLayer::new()
