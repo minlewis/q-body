@@ -35,6 +35,7 @@ mod evolution_gate;
 mod gate_audit;
 mod handler;
 mod health;
+mod kvconfig;
 mod queue;
 pub mod reflect;
 mod state;
