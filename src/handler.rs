@@ -79,7 +79,12 @@ impl QBodyHandler {
             agent_card,
             cost_journal: CostJournal::new(),
             journal: tokio::sync::RwLock::new(crate::journal::Journal::new()),
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                // 跨域重定向凭据隔离闸（借鉴 yoyo-evolve #1181）：仅同 origin 跟随，
+                // 跨域 307/302 拒绝，Authorization 不随重定向带过 origin 边界。
+                .redirect(crate::redirect::fail_closed_redirect_policy())
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 

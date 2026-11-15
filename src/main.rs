@@ -36,6 +36,7 @@ mod gate_audit;
 mod handler;
 mod health;
 mod queue;
+mod redirect;
 pub mod reflect;
 mod state;
 mod tools;
