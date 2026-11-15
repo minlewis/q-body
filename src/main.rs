@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 mod a2a;
 mod artifact;
 mod clamp;
+mod config_merge;
 mod darkroom;
 mod evolution_gate;
 mod gate_audit;
