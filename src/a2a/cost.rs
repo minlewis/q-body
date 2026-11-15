@@ -3,7 +3,14 @@
 //! 成本阈值用环境变量门控（`QBODY_COST_WARN_USD`），单任务 LLM 花费超线时
 //! 先在 journal 记一条 `cost_warn` 事件（警告先落账再考虑拦截，P0=journal 记忆优先）。
 //! 超线只警告不硬拦——警告可观测、执行不阻塞。
+//!
+//! ## 负债可视化到子代理粒度（借鉴 yoyo-evolve Fixes #1108）
+//! 每个 `CostWarnEvent` 的 `source`（task_id）即一次 LLM 调用的归属方——主会话
+//! 或委托出的子代理（sub_agent）共享同一 `CostJournal`，按 `source` 聚合即可把
+//! 成本负债透视到单次调用/单个子代理粒度，而不是只有一个整体数字。
 
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -19,16 +26,29 @@ pub fn cost_warn_threshold_usd() -> Option<f64> {
 }
 
 /// journal 事件：成本警告（内存层，P0 先落账）
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostWarnEvent {
     /// 事件时刻（RFC3339 UTC）
     pub at: String,
-    /// 触发来源（如 task_id）
+    /// 触发来源（如 task_id；主会话或委托出的子代理共享同一 source 命名空间）
     pub source: String,
     /// 本次 LLM 花费估算（美元）
     pub cost_usd: f64,
     /// 当前阈值（美元）
     pub threshold_usd: f64,
+}
+
+/// 单一成本归属方（source=task_id）的聚合开销，供 `/cost` 类端点按子代理粒度透视
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceCostBreakdown {
+    /// 归属方标识（即 CostWarnEvent.source：task_id）
+    pub source: String,
+    /// 该归属方触发的成本警告次数
+    pub warn_count: u64,
+    /// 该归属方累计估算花费（美元）
+    pub total_cost_usd: f64,
+    /// 最后一次触发时刻（RFC3339 UTC）；一次都未触发则空串
+    pub last_at: String,
 }
 
 /// 内存 journal：cost_warn 事件追加式记录
@@ -50,6 +70,37 @@ impl CostJournal {
     /// 读取全部事件（审计用）
     pub async fn events(&self) -> Vec<CostWarnEvent> {
         self.events.read().await.clone()
+    }
+
+    /// 按归属方（source=task_id）聚合成本开销，透视到主会话/子代理粒度
+    ///
+    /// 借鉴 yoyo-evolve Fixes #1108（"delegate overhead visible to sub-agent
+    /// granularity"）：负债不只给一个整体数字，而是按每个 source 分别累计
+    /// 警告次数 + 估算成本 + 最后触发时刻。空 journal → 空列表，不假造一条
+    /// 无意义的合计行（未测量即不得宣称，health.rs 三态同款纪律）。
+    pub async fn breakdown_by_source(&self) -> Vec<SourceCostBreakdown> {
+        let events = self.events.read().await;
+        // BTreeMap<source, (warn_count, total, last_at)> — 键有序，输出确定可测试
+        let mut acc: BTreeMap<String, (u64, f64, String)> = BTreeMap::new();
+        for ev in events.iter() {
+            let entry = acc
+                .entry(ev.source.clone())
+                .or_insert((0, 0.0, String::new()));
+            entry.0 += 1;
+            entry.1 += ev.cost_usd;
+            // 保留最晚 at（RFC3339 字典序即时间序）
+            if ev.at > entry.2 {
+                entry.2 = ev.at.clone();
+            }
+        }
+        acc.into_iter()
+            .map(|(source, (warn_count, total_cost_usd, last_at))| SourceCostBreakdown {
+                source,
+                warn_count,
+                total_cost_usd,
+                last_at,
+            })
+            .collect()
     }
 }
 
@@ -242,5 +293,76 @@ mod tests {
         assert_eq!(evs.len(), 3);
         assert_eq!(evs[0].source, "s0");
         assert_eq!(evs[2].source, "s2");
+    }
+
+    #[tokio::test]
+    async fn test_breakdown_empty_journal_is_empty() {
+        // 未测量即不宣称：空 journal → 空列表，不假造合计行（health.rs 三态纪律）
+        let journal = CostJournal::new();
+        assert!(journal.breakdown_by_source().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_breakdown_aggregates_per_source_subagent_granularity() {
+        // 主会话 task "main" 触发 2 次，委托出的子代理 "delegate-1"/"delegate-2"
+        // 各 1 次——负债必须透视到子代理粒度而非只给整体数字（yoyo #1108）
+        let journal = CostJournal::new();
+        for (at, source, cost) in [
+            ("2026-11-02T10:00:00Z", "main", 0.75),
+            ("2026-11-02T10:01:00Z", "delegate-1", 1.20),
+            ("2026-11-02T10:02:00Z", "main", 0.60),
+            ("2026-11-02T10:03:00Z", "delegate-2", 0.90),
+        ] {
+            journal
+                .record(CostWarnEvent {
+                    at: at.into(),
+                    source: source.into(),
+                    cost_usd: cost,
+                    threshold_usd: 0.5,
+                })
+                .await;
+        }
+
+        let mut bd = journal.breakdown_by_source().await;
+        // BTreeMap 键序：delegate-1 < delegate-2 < main
+        assert_eq!(bd.len(), 3);
+
+        let d1 = bd.remove(0);
+        assert_eq!(d1.source, "delegate-1");
+        assert_eq!(d1.warn_count, 1);
+        assert!((d1.total_cost_usd - 1.20).abs() < 1e-9);
+        assert_eq!(d1.last_at, "2026-11-02T10:01:00Z");
+
+        let d2 = bd.remove(0);
+        assert_eq!(d2.source, "delegate-2");
+        assert_eq!(d2.warn_count, 1);
+        assert!((d2.total_cost_usd - 0.90).abs() < 1e-9);
+        assert_eq!(d2.last_at, "2026-11-02T10:03:00Z");
+
+        let m = bd.remove(0);
+        assert_eq!(m.source, "main");
+        assert_eq!(m.warn_count, 2); // 同一归属方多次触发累计
+        assert!((m.total_cost_usd - 1.35).abs() < 1e-9);
+        assert_eq!(m.last_at, "2026-11-02T10:02:00Z"); // 保留最晚时刻（非最早）
+    }
+
+    #[tokio::test]
+    async fn test_breakdown_serialized_as_json() {
+        // SourceCostBreakdown 须可 JSON 序列化——/cost 端点直接回 this 结构
+        let journal = CostJournal::new();
+        journal
+            .record(CostWarnEvent {
+                at: "2026-11-02T10:00:00Z".into(),
+                source: "delegate-1".into(),
+                cost_usd: 1.20,
+                threshold_usd: 0.5,
+            })
+            .await;
+        let bd = journal.breakdown_by_source().await;
+        let json = serde_json::to_value(&bd[0]).unwrap();
+        assert_eq!(json["source"], "delegate-1");
+        assert_eq!(json["warn_count"], 1);
+        assert!((json["total_cost_usd"].as_f64().unwrap() - 1.20).abs() < 1e-9);
+        assert_eq!(json["last_at"], "2026-11-02T10:00:00Z");
     }
 }
