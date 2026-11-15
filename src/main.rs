@@ -51,6 +51,7 @@ mod webui;
 // ============================================================
 mod backlog;
 mod journal;
+mod merge_budget;
 
 use a2a::types::*;
 use handler::QBodyHandler;
