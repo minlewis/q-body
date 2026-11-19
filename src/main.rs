@@ -51,6 +51,7 @@ mod webui;
 // ============================================================
 mod backlog;
 mod journal;
+mod state_file_guard;
 
 use a2a::types::*;
 use handler::QBodyHandler;
