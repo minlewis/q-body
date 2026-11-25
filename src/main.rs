@@ -51,6 +51,7 @@ mod webui;
 // ============================================================
 mod backlog;
 mod journal;
+mod model_router;
 
 use a2a::types::*;
 use handler::QBodyHandler;
