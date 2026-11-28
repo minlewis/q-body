@@ -567,7 +567,11 @@ impl QBodyHandler {
                     // 取消分类（借鉴 yoyo-evolve #988）：Ctrl-C/用户取消不是真实失败，
                     // 不记 failure 事件（不污染失败计数）、不 failover（不重跑 fallback
                     // provider），直接终止 provider 链；真实失败才走原 failover 链。
-                    if crate::queue::is_user_cancellation(&e.to_string()) {
+                    // #1126 校准（2026-11-04）：reqwest 真实错误的关键判别文本常只在
+                    // source 链深处（display 只给 "error sending request..."），只匹配
+                    // display（e.to_string()）会让取消判别落空——展开全 source 链再判。
+                    let chain = crate::queue::error_chain_text(&e);
+                    if crate::queue::is_user_cancellation(&chain) {
                         tracing::info!(
                             "LLM call on {} canceled by user — not recording failure, not failing over",
                             provider.name
