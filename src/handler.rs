@@ -216,10 +216,6 @@ impl QBodyHandler {
             .and_then(|p| p.get("text"))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string());
-        let threshold = params
-            .as_ref()
-            .and_then(|p| p.get("threshold"))
-            .and_then(|t| t.as_f64());
 
         let Some(text) = text else {
             return serde_json::to_value(JsonRpcError::invalid_params(
@@ -229,8 +225,23 @@ impl QBodyHandler {
             .unwrap();
         };
 
+        // 数值参数 strict 校验：区分「缺省（回落默认）」与「存在但非法（拒绝执行，不回落默认）」
+        // 防止「threshold: "abc"」被静默当成 0.7 跑任务（SOUL §25，自 concealing 盲区）。
+        let th = match params.as_ref().map(|p| p.get("threshold")) {
+            None | Some(None) => crate::reflect::DEFAULT_THRESHOLD,
+            Some(Some(v)) => match v.as_f64() {
+                Some(f) => f,
+                None => {
+                    return serde_json::to_value(JsonRpcError::invalid_params(
+                        request_id,
+                        "invalid threshold: must be a number",
+                    ))
+                    .unwrap();
+                }
+            },
+        };
+
         let report = crate::reflect::score_reflection(&text);
-        let th = threshold.unwrap_or(crate::reflect::DEFAULT_THRESHOLD);
         let verdict = crate::reflect::verdict(&report, th);
 
         serde_json::to_value(JsonRpcResponse::success(
@@ -884,5 +895,54 @@ mod transport_scope_tests {
             skills: vec![],
             supported_interfaces: vec![],
         }
+    }
+
+    // === Reflect threshold 数值参数 strict 校验（2026-10-30 backlog 条目） ===
+    // 「存在但非法」的数字参数必须拒绝执行（invalid_params），不得静默回落默认值跑任务。
+    #[test]
+    fn test_reflect_invalid_threshold_rejected() {
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = h.handle_reflect(
+            Some(serde_json::json!({"text": "refactor", "threshold": "not-a-number"})),
+            serde_json::json!(1),
+        );
+        assert_eq!(out["error"]["code"].as_i64(), Some(-32602), "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("threshold"),
+            "{out}"
+        );
+        // 拒绝而非回落默认：不得产生 success 响应
+        assert!(out.get("result").is_none(), "{out}");
+    }
+
+    #[test]
+    fn test_reflect_valid_threshold_still_works() {
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = h.handle_reflect(
+            Some(serde_json::json!({"text": "refactor", "threshold": 0.9})),
+            serde_json::json!(1),
+        );
+        // 正路径不受影响：合法数字仍返回 success
+        assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(out["result"]["threshold"].as_f64(), Some(0.9), "{out}");
+    }
+
+    #[test]
+    fn test_reflect_absent_threshold_defaults() {
+        let h = QBodyHandler::new(TaskStore::new(), test_agent_card());
+        let out = h.handle_reflect(
+            Some(serde_json::json!({"text": "refactor"})),
+            serde_json::json!(1),
+        );
+        // 缺省（无 threshold 字段）回落默认阈值，不回退上次非法拒绝
+        assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(
+            out["result"]["threshold"].as_f64(),
+            Some(crate::reflect::DEFAULT_THRESHOLD),
+            "{out}"
+        );
     }
 }
