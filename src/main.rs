@@ -51,6 +51,7 @@ mod webui;
 // ============================================================
 mod backlog;
 mod journal;
+mod observation_bridge;
 
 use a2a::types::*;
 use handler::QBodyHandler;
