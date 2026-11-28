@@ -10,13 +10,114 @@
 
 use crate::validator::command as safety;
 use serde_json::json;
-use std::process::Command;
-use tokio::time::{Duration, timeout};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::sleep;
 
-/// 单次命令执行上限（秒）——防止挂死/无限输出型命令。
+/// 单条命令执行上限/grace 读上限（秒）——防止挂死/无限输出型命令。
 const CMD_TIMEOUT_SECS: u64 = 15;
+/// 超时终止后回收子进程输出的有界读取上限——防孙进程占管道导致永久等待
+/// （PR #162 run_shell_with_timeout 同型风险：后台孙进程占用输出管道 → exit/回收挂起）。
+const GRACE_READ_SECS: Duration = Duration::from_millis(500);
+
 /// 工具输出回喂 LLM 的字符上限——防爆 prompt（复用 clamp 哲学）。
 const OUTPUT_CLAMP_CHARS: usize = 4000;
+
+/// 组装正常完成（或超时快照）的 stdout/stderr 组合输出。
+/// 诚实语义（issue #140）：非零退出 + 零输出来 self 已明确「非零退出」；
+/// 超时本身不是正常完成，不得被组装成成功结果。
+fn combine_output(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> String {
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(stdout));
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("[stderr]\n");
+        combined.push_str(&stderr);
+    }
+    if combined.trim().is_empty() {
+        // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
+        combined = empty_output_verdict(exit_code.unwrap_or(-1));
+    } else if let Some(code) = exit_code {
+        if code != 0 {
+            combined = format!("exit={code}\n{combined}");
+        }
+    }
+    combined
+}
+
+/// 执行命令并在超时后终止，返回「完成 / 超时 + 已捕获输出快照」。
+/// 超时分支：kill 子进程 → 回收 → 有界 grace 读已产生输出 → 诚实标注「超时已终止」，
+/// 不丢弃 stdout/stderr（此前 tools.rs:229 超时即丢全部输出）。
+async fn run_shell_with_timeout(
+    command: &str,
+    timeout_secs: u64,
+) -> (bool, String, String, Option<i32>) {
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bash spawn 失败");
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    tokio::select! {
+        // biased: 正常完成优先于超时（同一轮就绪时先处理完成态）
+        status = child.wait() => {
+            let code = status.ok().and_then(|s| s.code());
+            let out = read_pipe(stdout).await.unwrap_or_default();
+            let err = read_pipe(stderr).await.unwrap_or_default();
+            (false, out, err, code)
+        }
+        _ = sleep(Duration::from_secs(timeout_secs)) => {
+            // 超时：杀子进程，尽量回收状态，有界读回已产生输出。
+            let _ = child.kill().await;
+            let _ = child.wait().await; // 回收 zombie
+            let out = read_pipe(stdout).await.unwrap_or_default();
+            let err = read_pipe(stderr).await.unwrap_or_default();
+            (true, out, err, None)
+        }
+    }
+}
+
+/// 有界读取管道内容——超时后孙进程可能仍持有写端，必须限时读防挂起。
+/// 泛型同时支持 stdout/stderr 管道。
+async fn read_pipe<R: AsyncRead + Unpin>(mut pipe: Option<R>) -> Option<String> {
+    let mut pipe = pipe?;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(GRACE_READ_SECS, pipe.read_to_end(&mut buf)).await;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn run_shell(command: &str) -> String {
+    let (timed_out, out, err, code) = run_shell_with_timeout(command, CMD_TIMEOUT_SECS).await;
+    if timed_out {
+        // 诚实语义：超时不是正常完成，不得按成功报告；携带已产生输出快照。
+        let mut msg = format!(
+            "超时：命令执行超过 {CMD_TIMEOUT_SECS}s，已终止（超时不是正常完成）"
+        );
+        if !out.trim().is_empty() {
+            msg.push_str("\n[已捕获 stdout]\n");
+            msg.push_str(out.trim_end());
+        }
+        if !err.trim().is_empty() {
+            msg.push_str("\n[已捕获 stderr]\n");
+            msg.push_str(err.trim_end());
+        }
+        if out.trim().is_empty() && err.trim().is_empty() {
+            msg.push_str("\n（超时时无任何已捕获输出——命令可能卡在未输出的阶段）");
+        }
+        clamp_output(msg)
+    } else {
+        clamp_output(combine_output(out.as_bytes(), err.as_bytes(), code))
+    }
+}
 
 /// 工具结果三态分类（issue #140）。
 /// 空匹配是合法成功（grep 无命中 / 空文件），路径缺失与不可读是错误——
@@ -218,39 +319,6 @@ pub async fn dispatch(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-async fn run_shell(command: &str) -> String {
-    let cmd = command.to_string();
-    let result = timeout(Duration::from_secs(CMD_TIMEOUT_SECS), async move {
-        tokio::task::spawn_blocking(move || Command::new("bash").arg("-c").arg(&cmd).output()).await
-    })
-    .await;
-
-    match result {
-        Err(_) => format!("超时：命令执行超过 {CMD_TIMEOUT_SECS}s，已终止"),
-        Ok(Err(join_err)) => format!("执行失败：{join_err}"),
-        Ok(Ok(Ok(out))) => {
-            let mut combined = String::new();
-            combined.push_str(&String::from_utf8_lossy(&out.stdout));
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.trim().is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str("[stderr]\n");
-                combined.push_str(&stderr);
-            }
-            if combined.trim().is_empty() {
-                // issue #140：非零退出 + 无输出不许谎报「成功退出」——诚实呈现退出码语义
-                combined = empty_output_verdict(out.status.code().unwrap_or(-1));
-            } else if !out.status.success() {
-                combined = format!("exit={}\n{combined}", out.status.code().unwrap_or(-1));
-            }
-            clamp_output(combined)
-        }
-        Ok(Ok(Err(e))) => format!("执行失败：{e}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +423,85 @@ mod tests {
     fn first_token_strips_path() {
         assert_eq!(first_token("/usr/bin/ls -la"), "ls");
         assert_eq!(first_token("df -h"), "df");
+    }
+
+    // ---- issue #218：超时分支保留已产生输出快照 + 诚实语义 ----
+
+    /// 测试辅助：直接跑 run_shell（返回已组装的 String，超时走快照路径）。
+    /// 内部调 run_shell_with_timeout 注入短超时，不污染全局 15s 常量。
+    async fn run_shell_with_timeout_exec(command: &str, secs: u64) -> String {
+        // 真实路径：CMD_TIMEOUT_SECS 是 const，编译期固定 15s；
+        // 测试想要短超时只能直接调 run_shell_with_timeout 再组装。
+        let (timed_out, out, err, code) = run_shell_with_timeout(command, secs).await;
+        if timed_out {
+            let mut msg =
+                format!("超时：命令执行超过 {secs}s，已终止（超时不是正常完成）");
+            if !out.trim().is_empty() {
+                msg.push_str("\n[已捕获 stdout]\n");
+                msg.push_str(out.trim_end());
+            }
+            if !err.trim().is_empty() {
+                msg.push_str("\n[已捕获 stderr]\n");
+                msg.push_str(err.trim_end());
+            }
+            if out.trim().is_empty() && err.trim().is_empty() {
+                msg.push_str("\n（超时时无任何已捕获输出——命令可能卡在未输出的阶段）");
+            }
+            msg
+        } else {
+            combine_output(out.as_bytes(), err.as_bytes(), code)
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_carries_partial_output_snapshot() {
+        // 先输出一段，再卡死：超时后必须携带已产生的 stdout/stderr 快照，
+        // 不得像旧实现 tools.rs:229 那样「超时即丢全部输出」。
+        let (timed_out, out, err, code) =
+            run_shell_with_timeout("echo BEFORE_TIMEOUT; sleep 30", 1).await;
+        assert!(timed_out, "必须走超时分支");
+        assert!(out.contains("BEFORE_TIMEOUT"), "快照必须保留 stdout: {out:?}");
+        assert_eq!(code, None, "超时分支不谎报退出码");
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_stderr_snapshot() {
+        let (timed_out, out, err, code) =
+            run_shell_with_timeout("echo TO_ERR 1>&2; sleep 30", 1).await;
+        assert!(timed_out);
+        assert!(err.contains("TO_ERR"), "快照必须保留 stderr: {err:?}");
+        assert!(out.is_empty(), "stdout 应为空: {out:?}");
+        assert_eq!(code, None);
+    }
+
+    #[tokio::test]
+    async fn timeout_with_no_output_is_honest_about_it() {
+        // 卡在未输出阶段：消息必须诚实说明无输出，不编造成功。
+        let out = run_shell_with_timeout_exec("exec sleep 30", 1).await;
+        assert!(out.contains("超时"), "got: {out}");
+        assert!(out.contains("无任何已捕获输出"), "got: {out}");
+        assert!(!out.contains("成功"), "超时不是成功: {out}");
+    }
+
+    #[tokio::test]
+    async fn quick_command_not_timed_out() {
+        // 正常完成对照：不触发超时、退出码如实、输出完整。
+        let (timed_out, out, err, code) = run_shell_with_timeout("echo DONE_OK", 5).await;
+        assert!(!timed_out);
+        assert!(out.contains("DONE_OK"), "got: {out:?}");
+        assert_eq!(code, Some(0), "got: {code:?}");
+        assert!(err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_through_dispatch() {
+        // 端到端：dispatch 层超时消息含「已终止」与「不是正常完成」，不谎报。
+        // tail -f /dev/null 在白名单且永不退出 → 真实走 15s 超时分支。
+        let out =
+            dispatch("run_readonly", &json!({"command": "tail -f /dev/null"})).await;
+        assert!(out.contains("超时"), "got: {out}");
+        assert!(out.contains("不是正常完成"), "got: {out}");
+        assert!(!out.contains("成功"), "got: {out}");
     }
 
     #[test]
