@@ -28,6 +28,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 mod a2a;
+mod acceptance_gate;
 mod artifact;
 mod clamp;
 mod darkroom;
