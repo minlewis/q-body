@@ -88,6 +88,48 @@ pub enum EvolutionStage {
     Verification,
 }
 
+/// 进化事件来源标记 — 账本污染溯源（issue #163 承接，deepcoldy/botmux 借鉴对齐）。
+///
+/// 每条写入账本的记录都带上"谁写的"，让 test 模式数据与真实账本可区分：
+/// 借鉴来源：yologdev/yoyo-evolve #1071 — test-model 污染 audit.jsonl 被溯源断源，
+/// 写入前断言来源、污染即归零。q-body 对应：EvolutionEvent.origin + 自检钩子
+/// 扫描 journal 无 test 来源记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalOrigin {
+    /// 生产 bot / cron 实际写入（真实进化账本）
+    Bot,
+    /// 测试或 mock 写入 — 只应落到独立临时文件，不得进入真实账本
+    Test,
+    /// 人工（老板 / 操作者）写入
+    Manual,
+}
+
+impl Default for JournalOrigin {
+    fn default() -> Self {
+        JournalOrigin::Bot
+    }
+}
+
+impl JournalOrigin {
+    /// 词表内的规范小写拼写（与 JSONL 序列化一致，单一事实源）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JournalOrigin::Bot => "bot",
+            JournalOrigin::Test => "test",
+            JournalOrigin::Manual => "manual",
+        }
+    }
+
+    /// 未知值解析回落为 Bot（保持向前兼容——旧 journal 行无 origin 字段时用此默认）
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "test" => JournalOrigin::Test,
+            "manual" => JournalOrigin::Manual,
+            _ => JournalOrigin::Bot,
+        }
+    }
+}
+
 /// 单条进化事件记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionEvent {
@@ -95,6 +137,13 @@ pub struct EvolutionEvent {
     pub signal: EvolutionSignal,
     pub source: String,
     pub suggestion: String,
+    /// 写入来源标记（bot/test/manual）。
+    ///
+    /// `#[serde(default)]` 保证旧 journal JSONL 行（无 origin 字段）仍可解析，
+    /// 默认为 Bot —— 绝不因新增字段把存量账本整行降级到 unrecognized 计数
+    /// （那会让整批旧数据从账本上静默消失）。
+    #[serde(default)]
+    pub origin: JournalOrigin,
     /// 实际改动内容（闭环推进到 Action 阶段后填入）
     pub action: Option<String>,
     /// 验证结果（闭环推进到 Verification 阶段后填入，如 "cargo test passed"）
@@ -258,12 +307,39 @@ impl Journal {
     }
 
     /// 记录一条进化事件（仅 Source / Suggestion 两阶段，action/verification 暂缺）。
+    ///
+    /// 来源标记默认 Bot（生产 cron/bot 写入）。测试写入真实账本前必须显式
+    /// 指定 Test —— 自检钩子会扫描 journal 无 test 来源记录（账本污染零容忍）。
     pub fn record(&mut self, signal: EvolutionSignal, source: String, suggestion: String) {
         self.events.push(EvolutionEvent {
             timestamp: Utc::now(),
             signal,
             source,
             suggestion,
+            origin: JournalOrigin::Bot,
+            action: None,
+            verification: None,
+            consumed_at: None,
+        });
+    }
+
+    /// 记录一条带显式来源标记的进化事件。
+    ///
+    /// 测试/mock 写入真实账本时携带 `JournalOrigin::Test`；
+    /// 生产路径默认走 `record`（Bot）。供接线方在来源明确时透传。
+    pub fn record_with_origin(
+        &mut self,
+        signal: EvolutionSignal,
+        source: String,
+        suggestion: String,
+        origin: JournalOrigin,
+    ) {
+        self.events.push(EvolutionEvent {
+            timestamp: Utc::now(),
+            signal,
+            source,
+            suggestion,
+            origin,
             action: None,
             verification: None,
             consumed_at: None,
@@ -284,6 +360,7 @@ impl Journal {
             signal,
             source,
             suggestion,
+            origin: JournalOrigin::Bot,
             action: Some(action),
             verification: Some(verification),
             consumed_at: None,
@@ -293,6 +370,23 @@ impl Journal {
     /// 返回指定信号类型的计数器
     pub fn count_by_signal(&self, signal: &EvolutionSignal) -> usize {
         self.events.iter().filter(|e| e.signal == *signal).count()
+    }
+
+    /// 返回指定来源标记的事件数（账本污染溯源，issue #163）。
+    ///
+    /// 配合自检钩子使用：真实账本中 `JournalOrigin::Test` 计数必须为 0，
+    /// 任何测试尝试写真实账本的行都会被这里照出来。
+    pub fn count_by_origin(&self, origin: JournalOrigin) -> usize {
+        self.events.iter().filter(|e| e.origin == origin).count()
+    }
+
+    /// 真实账本是否有 test 来源污染的进化事件（自检钩子核心判定）。
+    ///
+    /// 借鉴：yologdev/yoyo-evolve #1071 — test-model 污染 audit.jsonl 被溯源断源。
+    /// 自检 cron 对被审计的 journal 文件 load 后调本方法：true 即告警、污染即归零，
+    /// 测试数据绝不允许混进真实进化账本。
+    pub fn has_test_origin_events(&self) -> bool {
+        self.count_by_origin(JournalOrigin::Test) > 0
     }
 
     /// 统计已推进到指定阶段的事件数（用于 dedup/refactor 候选检测：同类事件≥2 次）。
@@ -1491,6 +1585,74 @@ mod tests {
         assert_eq!(loaded.skips()[0].timestamp, journal.skips()[0].timestamp);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- journal origin 账本污染溯源（issue #163，yoyo #1071 同款）----
+
+    #[test]
+    fn test_default_record_origin_is_bot() {
+        let mut journal = Journal::new();
+        journal.record(EvolutionSignal::Refactor, "src".into(), "suggestion".into());
+        let ev = &journal.events[0];
+        assert_eq!(ev.origin, JournalOrigin::Bot);
+        assert_eq!(journal.count_by_origin(JournalOrigin::Bot), 1);
+        assert_eq!(journal.count_by_origin(JournalOrigin::Test), 0);
+        assert!(!journal.has_test_origin_events());
+    }
+
+    #[test]
+    fn test_record_with_origin_marks_test() {
+        let mut journal = Journal::new();
+        journal.record_with_origin(
+            EvolutionSignal::Test,
+            "mock-source".into(),
+            "mock suggestion".into(),
+            JournalOrigin::Test,
+        );
+        journal.record_with_origin(
+            EvolutionSignal::Refactor,
+            "manual-source".into(),
+            "manual suggestion".into(),
+            JournalOrigin::Manual,
+        );
+        assert_eq!(journal.count_by_origin(JournalOrigin::Bot), 0);
+        assert_eq!(journal.count_by_origin(JournalOrigin::Test), 1);
+        assert_eq!(journal.count_by_origin(JournalOrigin::Manual), 1);
+        assert!(journal.has_test_origin_events());
+    }
+
+    #[test]
+    fn test_origin_survives_persist_load_roundtrip() {
+        let mut journal = Journal::new();
+        journal.record_with_origin(
+            EvolutionSignal::Test,
+            "mock".into(),
+            "mock suggestion".into(),
+            JournalOrigin::Test,
+        );
+        journal.record(EvolutionSignal::Bump, "cron".into(), "bump suggestion".into());
+
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let path = format!("/tmp/test_journal_origin_{}.jsonl", timestamp);
+        journal
+            .persist_to_jsonl(&path)
+            .expect("persist should succeed");
+        let loaded = Journal::load_from_jsonl(&path).expect("load should succeed");
+
+        assert!(loaded.has_test_origin_events());
+        assert_eq!(loaded.count_by_origin(JournalOrigin::Test), 1);
+        assert_eq!(loaded.count_by_origin(JournalOrigin::Bot), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_row_without_origin_defaults_to_bot() {
+        // 旧 journal 行无 origin 字段 → serde default 回落为 Bot，
+        // 绝不因新增字段把存量账本整行降级到 unrecognized（账本静默消失）。
+        let line = r#"{"timestamp":"2026-10-01T00:00:00Z","signal":"Refactor","source":"old","suggestion":"legacy"}"#;
+        let ev: EvolutionEvent = serde_json::from_str(line).expect("legacy row should parse");
+        assert_eq!(ev.origin, JournalOrigin::Bot);
+        assert_eq!(ev.source, "old");
     }
 
     #[test]
