@@ -533,6 +533,25 @@ impl QBodyHandler {
                             }
                             let err_msg =
                                 body["error"]["message"].as_str().unwrap_or("unknown error");
+                            // 配置层修复提示（借鉴 yoyo-evolve #1163 auth-hint）：
+                            // 400/401/403/429 把裸错误翻译成「去哪改、改哪项」，不直接穿透。
+                            let (hint_tier, auth_hint) = crate::auth_hint::auth_hint_for(
+                                status.as_u16(),
+                                provider.api_key_env,
+                                provider.name,
+                            );
+                            let user_msg = match (hint_tier, auth_hint) {
+                                (crate::auth_hint::HintTier::None, _) => {
+                                    format!("Sorry, LLM returned error {}: {}", status, err_msg)
+                                }
+                                (_, Some(hint)) => format!(
+                                    "Sorry, LLM returned error {}: {}. {}",
+                                    status, err_msg, hint
+                                ),
+                                _ => {
+                                    format!("Sorry, LLM returned error {}: {}", status, err_msg)
+                                }
+                            };
                             let full_err = format!(
                                 "LLM API error on {} ({}): {} — failing over",
                                 provider.name, status, err_msg
@@ -543,9 +562,8 @@ impl QBodyHandler {
                                 full_err.len(),
                                 &full_err,
                             );
-                            tracing::error!("{}", full_err);
-                            last_err =
-                                Some(format!("Sorry, LLM returned error {}: {}", status, err_msg));
+                            tracing::error!("{} (auth_hint={:?})", full_err, hint_tier);
+                            last_err = Some(user_msg);
                         }
                         Err(e) => {
                             let full_err = format!(
