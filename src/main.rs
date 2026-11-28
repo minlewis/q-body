@@ -43,6 +43,7 @@ mod trust_input;
 mod usage;
 mod validator;
 mod webui;
+mod worktree;
 
 // ============================================================
 // standalone 纯函数模块（learnings / clamp / darkroom 同先例）：
